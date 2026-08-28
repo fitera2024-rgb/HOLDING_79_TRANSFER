@@ -1,0 +1,19 @@
+{
+  "contract_version": "0.2-approved",
+  "accepted_base_policy": "main",
+  "live_1c_allowed": false,
+  "auto_merge_allowed": false,
+  "manager_organization": "ГК",
+  "manager_financial_department": "Б_ГК Финансовый отдел",
+  "source_accounts": [
+    "79.2",
+    "79.3"
+  ],
+  "approved_golden_cases": [
+    "DEBIT_79_2_AT",
+    "CREDIT_79_2_AT",
+    "DEBIT_79_3_AT",
+    "CREDIT_79_3_AT"
+  ],
+  "reference_output_contract": "HAT 27-column Загрузка_A_AA format"
+}

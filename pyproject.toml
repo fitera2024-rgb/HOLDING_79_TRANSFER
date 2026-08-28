@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "holding79-transfer"
+version = "0.0.1"
+description = "Month-end 79.2/79.3 to 79.1 transfer journal generator"
+requires-python = ">=3.12"
+dependencies = ["openpyxl>=3.1,<4", "pydantic>=2.9,<3", "pyyaml>=6,<7"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "ruff>=0.8"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/holding79_transfer"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

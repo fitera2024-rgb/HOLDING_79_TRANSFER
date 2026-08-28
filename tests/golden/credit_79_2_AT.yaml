@@ -1,0 +1,26 @@
+id: CREDIT_79_2_AT
+status: APPROVED
+input:
+  organization: АТ
+  source_account: "79.2"
+  department: Б_АТ Коммерческий отдел
+  supplier_rvp: Производитель
+  ending_debit: "0"
+  ending_credit: "84272.40"
+expected:
+  - document_organization: АТ
+    debit_account: "79.2"
+    debit_department: Б_АТ Коммерческий отдел
+    debit_supplier_rvp: Производитель
+    credit_account: "79.1"
+    credit_department: Б_АТ Коммерческий отдел
+    credit_supplier_rvp: ГК
+    amount: "84272.40"
+  - document_organization: ГК
+    debit_account: "79.1"
+    debit_department: Б_ГК Финансовый отдел
+    debit_supplier_rvp: Производитель
+    credit_account: "79.1"
+    credit_department: Б_ГК Финансовый отдел
+    credit_supplier_rvp: АТ
+    amount: "84272.40"
