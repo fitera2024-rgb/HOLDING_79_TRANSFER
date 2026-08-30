@@ -27,6 +27,18 @@ from .exporter import (
     validate_workbook_round_trip,
     write_xlsx,
 )
+from .integration import (
+    CONTROL_SHEET_NAMES,
+    RUN_ARTIFACT_NAMES,
+    IntegrationRunConfig,
+    IntegrationRunError,
+    IntegrationRunResult,
+    build_synthetic_osv_workbook,
+    run_end_to_end,
+    run_integration,
+    run_local_synthetic,
+    run_synthetic_integration,
+)
 from .models import (
     CONTRACT_VERSION,
     CREDIT_RULE_ID,
@@ -89,6 +101,7 @@ from .transfer import (
 
 __all__ = [
     "CONTRACT_VERSION",
+    "CONTROL_SHEET_NAMES",
     "CREDIT_RULE_ID",
     "DEBIT_RULE_ID",
     "HEADER",
@@ -98,6 +111,7 @@ __all__ = [
     "OUTPUT_HEADERS",
     "OUTPUT_SHEET_NAME",
     "RULES_VERSION",
+    "RUN_ARTIFACT_NAMES",
     "AccountCode",
     "BalanceSide",
     "BalanceStatus",
@@ -113,6 +127,9 @@ __all__ = [
     "ExporterConfig",
     "FilenameCollisionError",
     "GroupedOsvParser",
+    "IntegrationRunConfig",
+    "IntegrationRunError",
+    "IntegrationRunResult",
     "NormalizationStatus",
     "NormalizedBalance",
     "OutputAdapterConfig",
@@ -137,6 +154,7 @@ __all__ = [
     "XlsxExportResult",
     "XlsxExporter",
     "__version__",
+    "build_synthetic_osv_workbook",
     "build_transfer",
     "build_transfer_rows",
     "deterministic_filename",
@@ -156,6 +174,10 @@ __all__ = [
     "parse_grouped_osv_xlsx",
     "parse_osv",
     "rule_id_for_side",
+    "run_end_to_end",
+    "run_integration",
+    "run_local_synthetic",
+    "run_synthetic_integration",
     "sanitize_filename_component",
     "try_map_posting_row",
     "validate_normalized_balance",
