@@ -269,6 +269,32 @@ def test_source_effect_control_fails_closed_for_wrong_amount_or_duplicate_source
     assert not duplicate_control.source_consumed_once
 
 
+def test_source_effect_control_rejects_rules_version_and_trace_mismatches():
+    balance = make_balance(load("debit_79_2_AT.yaml"))
+    result = generate_transfer(balance)
+    source_row, gk_row = result.rows
+
+    assert validate_source_effect(balance, (source_row, gk_row)).passed
+
+    wrong_source_rules = source_row.model_copy(
+        update={"rules_version": "WRONG_RULES"}
+    )
+    wrong_gk_rules = gk_row.model_copy(update={"rules_version": "WRONG_RULES"})
+    mixed_rules = gk_row.model_copy(update={"rules_version": "ANOTHER_RULES"})
+    wrong_record_id = source_row.model_copy(
+        update={"financial_record_id": "FR-wrong"}
+    )
+
+    assert not validate_source_effect(
+        balance, (wrong_source_rules, gk_row)
+    ).passed
+    assert not validate_source_effect(balance, (source_row, wrong_gk_rules)).passed
+    assert not validate_source_effect(balance, (source_row, mixed_rules)).passed
+    assert not validate_source_effect(
+        balance, (wrong_record_id, gk_row)
+    ).passed
+
+
 def test_batch_rejects_reusing_one_source_row_reference_and_returns_no_partial_rows():
     balance = make_balance(load("debit_79_3_AT.yaml"))
 

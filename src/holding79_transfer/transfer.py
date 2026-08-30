@@ -360,6 +360,7 @@ def _direction_is_correct(
             source_row.financial_record_id
             == financial_record_id(balance, config.rules_version),
             source_row.side is balance.ending_side,
+            source_row.rules_version == config.rules_version,
             gk_row.period_end == balance.period_end,
             gk_row.source_organization == balance.organization,
             gk_row.source_account == balance.source_account,
@@ -369,6 +370,7 @@ def _direction_is_correct(
             gk_row.financial_record_id
             == financial_record_id(balance, config.rules_version),
             gk_row.side is balance.ending_side,
+            gk_row.rules_version == config.rules_version,
         )
     )
     if balance.ending_side is BalanceSide.DEBIT:
