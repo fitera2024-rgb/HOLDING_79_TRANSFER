@@ -11,14 +11,17 @@ from __future__ import annotations
 import io
 import re
 import unicodedata
+import zipfile
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
 from typing import Any, BinaryIO
+from xml.etree.ElementTree import ParseError as XmlParseError
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.utils.exceptions import InvalidFileException
 from openpyxl.worksheet.worksheet import Worksheet
 
 from .models import (
@@ -46,6 +49,16 @@ _DATE_RE = re.compile(
     r"(?<!\d)(?P<day>\d{1,2})[./-](?P<month>\d{1,2})[./-](?P<year>\d{4})(?!\d)"
 )
 _ISO_DATE_RE = re.compile(r"(?<!\d)(?P<year>\d{4})-(?P<month>\d{1,2})-(?P<day>\d{1,2})(?!\d)")
+_SOURCE_LOAD_ERRORS = (
+    zipfile.BadZipFile,
+    zipfile.LargeZipFile,
+    InvalidFileException,
+    OSError,
+    EOFError,
+    KeyError,
+    ValueError,
+    XmlParseError,
+)
 
 
 class ParserDiagnosticCode(str, Enum):
@@ -201,15 +214,28 @@ class _HierarchyState:
         self.role_depths = {}
 
     def set_identity(self, role: str, value: str) -> None:
+        self.invalidate_for_boundary(role)
         if role == "organization":
             self.organization = value
+        elif role == "department":
+            self.department = value
+        elif role == "supplier":
+            self.supplier_rvp = value
+        else:  # pragma: no cover - internal classifier guard
+            raise ValueError(f"unsupported hierarchy role: {role}")
+
+    def invalidate_for_boundary(self, role: str) -> None:
+        """Drop the identity at a role boundary and every descendant."""
+
+        if role == "organization":
+            self.organization = None
             self.department = None
             self.supplier_rvp = None
         elif role == "department":
-            self.department = value
+            self.department = None
             self.supplier_rvp = None
         elif role == "supplier":
-            self.supplier_rvp = value
+            self.supplier_rvp = None
         else:  # pragma: no cover - internal classifier guard
             raise ValueError(f"unsupported hierarchy role: {role}")
 
@@ -819,7 +845,15 @@ class GroupedOsvParser:
         loaded = None
         close_workbook = False
         try:
-            loaded = _load_source(source)
+            try:
+                loaded = _load_source(source)
+            except _SOURCE_LOAD_ERRORS:
+                diagnostic = ParserDiagnostic(
+                    ParserDiagnosticCode.INVALID_SOURCE,
+                    "source workbook is not a valid XLSX file",
+                )
+                return ParseResult(BalanceStatus.BLOCKED, diagnostics=(diagnostic,))
+
             if isinstance(loaded, Worksheet):
                 worksheet = loaded
             else:
@@ -829,14 +863,6 @@ class GroupedOsvParser:
                     return ParseResult(BalanceStatus.BLOCKED, diagnostics=(selected,))
                 worksheet = selected
             return self._parse_worksheet(worksheet)
-        except (OSError, TypeError, ValueError) as exc:
-            sheet_name = getattr(loaded, "title", None)
-            diagnostic = ParserDiagnostic(
-                ParserDiagnosticCode.INVALID_SOURCE,
-                f"cannot read grouped ОСВ XLSX safely: {exc}",
-                sheet_name,
-            )
-            return ParseResult(BalanceStatus.BLOCKED, diagnostics=(diagnostic,))
         finally:
             if close_workbook and loaded is not None and not isinstance(loaded, Worksheet):
                 loaded[0].close()
@@ -1158,6 +1184,7 @@ class GroupedOsvParser:
             if role == "total":
                 return None, None
             if role != "technical":
+                state.invalidate_for_boundary(role)
                 if role == "department" and not state.organization:
                     return role, _diagnostic(
                         ParserDiagnosticCode.MISSING_ORGANIZATION,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
+from io import BytesIO
 
 import pytest
 from openpyxl import Workbook
@@ -9,6 +10,7 @@ from openpyxl.styles import Alignment
 
 from holding79_transfer import (
     BalanceStatus,
+    GroupedOsvParser,
     ParserDiagnosticCode,
     parse_grouped_osv,
 )
@@ -47,6 +49,12 @@ def make_workbook(
 
 def parse(rows: list[tuple[str, object, object, int | None]], **kwargs):
     return parse_grouped_osv(make_workbook(rows, **kwargs), period_end=date(2024, 12, 31))
+
+
+def workbook_bytes(workbook: Workbook) -> bytes:
+    stream = BytesIO()
+    workbook.save(stream)
+    return stream.getvalue()
 
 
 def leaf(
@@ -228,6 +236,132 @@ def test_financial_payload_after_hierarchy_reset_with_incomplete_identity_blocks
         and diagnostic.excel_row == 11
         for diagnostic in result.diagnostics
     )
+
+
+def test_bare_organization_boundary_invalidates_stale_context():
+    rows = leaf("79.2", "A", "D", "S", "1.00")
+    rows += [
+        ("Организация", None, None, 1),
+        ("Поставщик РВП: T", "2.00", 0, 3),
+    ]
+
+    result = parse(rows)
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.balances == ()
+    assert result.diagnostics[-1].code is ParserDiagnosticCode.MISSING_ORGANIZATION
+
+
+def test_bare_department_boundary_invalidates_stale_context():
+    rows = leaf("79.2", "A", "D", "S", "1.00")
+    rows += [
+        ("Подразделение", None, None, 2),
+        ("Поставщик РВП: T", "2.00", 0, 3),
+    ]
+
+    result = parse(rows)
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.balances == ()
+    assert result.diagnostics[-1].code is ParserDiagnosticCode.MISSING_DEPARTMENT
+
+
+def test_new_department_cannot_repair_an_incomplete_organization_boundary():
+    rows = leaf("79.2", "A", "D", "S", "1.00")
+    rows += [
+        ("Организация", None, None, 1),
+        ("ЦФО: E", None, None, 2),
+        ("Поставщик РВП: T", "2.00", 0, 3),
+    ]
+
+    result = parse(rows)
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.balances == ()
+    assert any(
+        diagnostic.code is ParserDiagnosticCode.MISSING_ORGANIZATION
+        for diagnostic in result.diagnostics
+    )
+
+
+def test_supplier_payload_after_incomplete_department_boundary_is_blocked():
+    rows = leaf("79.2", "A", "D", "S", "1.00")
+    rows += [
+        ("ЦФО", None, None, 2),
+        ("Поставщик РВП: T", "2.00", 0, 3),
+    ]
+
+    result = parse(rows)
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.balances == ()
+    assert result.diagnostics[-1].code is ParserDiagnosticCode.MISSING_DEPARTMENT
+
+
+def test_complete_hierarchy_after_incomplete_boundary_restores_only_new_context():
+    rows = [
+        ("79.2", None, None, 0),
+        ("Организация: A", None, None, 1),
+        ("ЦФО: D", None, None, 2),
+        ("Организация", None, None, 1),
+        ("Организация: B", None, None, 1),
+        ("ЦФО: E", None, None, 2),
+        ("Поставщик РВП: T", "2.00", 0, 3),
+    ]
+
+    result = parse(rows)
+
+    assert result.status is BalanceStatus.ACTIONABLE
+    assert [(b.organization, b.department, b.supplier_rvp) for b in result.balances] == [
+        ("B", "E", "T")
+    ]
+
+
+def test_non_hierarchy_presentation_text_does_not_reset_valid_context():
+    workbook = make_workbook(leaf("79.2", "A", "D", "S", "1.00"))
+    worksheet = workbook.active
+    worksheet.cell(10, 1).value = None
+    worksheet.cell(10, 2).value = "Сформировано автоматически"
+
+    result = parse_grouped_osv(workbook, period_end=date(2024, 12, 31))
+
+    assert result.status is BalanceStatus.ACTIONABLE
+    assert [(b.organization, b.department, b.supplier_rvp) for b in result.balances] == [
+        ("A", "D", "S")
+    ]
+
+
+@pytest.mark.parametrize("source", [b"not xlsx", b"PK\x03\x04", b""])
+def test_malformed_xlsx_bytes_return_invalid_source_blocked(source):
+    result = parse_grouped_osv(source, period_end=date(2024, 12, 31))
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.balances == ()
+    assert result.diagnostics[0].code is ParserDiagnosticCode.INVALID_SOURCE
+    assert result.message == "source workbook is not a valid XLSX file"
+
+
+def test_valid_xlsx_bytes_still_parse_normally():
+    source = workbook_bytes(make_workbook(leaf("79.2", "A", "D", "S", "1.00")))
+
+    result = parse_grouped_osv(source, period_end=date(2024, 12, 31))
+
+    assert result.status is BalanceStatus.ACTIONABLE
+    assert [(b.organization, b.department, b.supplier_rvp) for b in result.balances] == [
+        ("A", "D", "S")
+    ]
+
+
+def test_internal_type_error_is_not_converted_to_invalid_source(monkeypatch):
+    workbook = make_workbook(leaf("79.2", "A", "D", "S", "1.00"))
+
+    def raise_internal_type_error(_parser, _worksheet):
+        raise TypeError("internal parser bug")
+
+    monkeypatch.setattr(GroupedOsvParser, "_parse_worksheet", raise_internal_type_error)
+
+    with pytest.raises(TypeError, match="internal parser bug"):
+        GroupedOsvParser(period_end=date(2024, 12, 31)).parse(workbook)
 
 
 def test_blank_non_financial_layout_row_can_be_skipped():
