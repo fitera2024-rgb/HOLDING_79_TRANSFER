@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import zipfile
 from datetime import date
 from decimal import Decimal
 from io import BytesIO
@@ -334,6 +335,31 @@ def test_non_hierarchy_presentation_text_does_not_reset_valid_context():
 @pytest.mark.parametrize("source", [b"not xlsx", b"PK\x03\x04", b""])
 def test_malformed_xlsx_bytes_return_invalid_source_blocked(source):
     result = parse_grouped_osv(source, period_end=date(2024, 12, 31))
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.balances == ()
+    assert result.diagnostics[0].code is ParserDiagnosticCode.INVALID_SOURCE
+    assert result.message == "source workbook is not a valid XLSX file"
+
+
+def test_non_integer_worksheet_sheet_id_returns_invalid_source_blocked():
+    source = workbook_bytes(make_workbook(leaf("79.2", "A", "D", "S", "1.00")))
+    malformed_source = BytesIO()
+
+    with (
+        zipfile.ZipFile(BytesIO(source)) as workbook_archive,
+        zipfile.ZipFile(malformed_source, "w") as malformed_archive,
+    ):
+        for info in workbook_archive.infolist():
+            content = workbook_archive.read(info.filename)
+            if info.filename == "xl/workbook.xml":
+                assert b'sheetId="1"' in content
+                content = content.replace(
+                    b'sheetId="1"', b'sheetId="not-an-integer"', 1
+                )
+            malformed_archive.writestr(info, content)
+
+    result = parse_grouped_osv(malformed_source.getvalue(), period_end=date(2024, 12, 31))
 
     assert result.status is BalanceStatus.BLOCKED
     assert result.balances == ()

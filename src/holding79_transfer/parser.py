@@ -56,6 +56,7 @@ _SOURCE_LOAD_ERRORS = (
     OSError,
     EOFError,
     KeyError,
+    TypeError,
     ValueError,
     XmlParseError,
 )
