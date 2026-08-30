@@ -112,6 +112,31 @@ def test_technical_ov_fv_rows_and_identical_presentation_rows_do_not_duplicate_l
     assert result.balances[0].supplier_rvp == "Производитель"
 
 
+def test_presentation_dedup_does_not_cross_an_intervening_financial_supplier_leaf():
+    rows = leaf("79.2", "АТ", "ЦФО", "Supplier A", "10.00")
+    rows += [
+        ("Supplier B", "20.00", 0, 3),
+        ("ОВ", "20.00", 0, 4),
+        ("ФВ", "20.00", 0, 4),
+        ("Итого по поставщику", "20.00", 0, 3),
+        ("Поставщик РВП: Supplier A", "10.00", 0, 3),
+    ]
+
+    result = parse(rows)
+
+    assert result.status is BalanceStatus.ACTIONABLE
+    assert [(balance.supplier_rvp, balance.ending_debit) for balance in result.balances] == [
+        ("Supplier A", Decimal("10.00")),
+        ("Supplier B", Decimal("20.00")),
+        ("Supplier A", Decimal("10.00")),
+    ]
+    assert [balance.source_excel_row_ref for balance in result.balances] == [
+        "ОСВ!R9",
+        "ОСВ!R10",
+        "ОСВ!R14",
+    ]
+
+
 def test_indentation_recovers_supplier_department_and_organization_boundaries():
     rows = [
         ("79.2", None, None, 0),
@@ -150,6 +175,108 @@ def test_account_boundary_resets_stale_context_and_missing_context_blocks():
     assert result.status is BalanceStatus.BLOCKED
     assert result.balances == ()
     assert result.diagnostics[0].code is ParserDiagnosticCode.MISSING_ORGANIZATION
+
+
+@pytest.mark.parametrize("debit,credit", [("100.00", 0), (0, "100.00")])
+def test_financial_payload_with_blank_grouping_before_any_account_blocks(debit, credit):
+    rows = [("", debit, credit, None)]
+    rows += leaf("79.2", "АТ", "ЦФО", "После строки", "1.00")
+
+    result = parse(rows)
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.balances == ()
+    assert result.diagnostics[0].code is ParserDiagnosticCode.MISSING_ACCOUNT_CONTEXT
+    assert result.diagnostics[0].excel_row == 6
+
+
+def test_financial_payload_after_unsupported_account_has_explicit_context_diagnostic():
+    rows = [
+        ("80.1", None, None, 0),
+        ("", "100.00", 0, None),
+    ]
+    rows += leaf("79.2", "АТ", "ЦФО", "После строки", "1.00")
+
+    result = parse(rows)
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.balances == ()
+    assert any(
+        diagnostic.code is ParserDiagnosticCode.UNSUPPORTED_ACCOUNT
+        for diagnostic in result.diagnostics
+    )
+    assert any(
+        diagnostic.code is ParserDiagnosticCode.MISSING_ACCOUNT_CONTEXT
+        and diagnostic.excel_row == 7
+        for diagnostic in result.diagnostics
+    )
+
+
+def test_financial_payload_after_hierarchy_reset_with_incomplete_identity_blocks():
+    rows = leaf("79.2", "АТ", "ЦФО", "До сброса", "1.00")
+    rows += [
+        ("Организация: Новая АТ", None, None, 1),
+        ("", "100.00", 0, None),
+    ]
+
+    result = parse(rows)
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.balances == ()
+    assert any(
+        diagnostic.code is ParserDiagnosticCode.AMBIGUOUS_HIERARCHY
+        and diagnostic.excel_row == 11
+        for diagnostic in result.diagnostics
+    )
+
+
+def test_blank_non_financial_layout_row_can_be_skipped():
+    rows = [("", 0, 0, None)]
+    rows += leaf("79.2", "АТ", "ЦФО", "Поставщик", "1.00")
+
+    result = parse(rows)
+
+    assert result.status is BalanceStatus.ACTIONABLE
+    assert len(result.balances) == 1
+
+
+@pytest.mark.parametrize(
+    "rows,code",
+    [
+        (
+            [
+                ("79.2", None, None, 0),
+                ("АТ", None, None, 1),
+                ("ЦФО: ЦФО", None, None, 2),
+                ("Организация: АТ-новая", "100.00", 0, 1),
+            ],
+            ParserDiagnosticCode.MISSING_DEPARTMENT,
+        ),
+        (
+            [
+                ("79.2", None, None, 0),
+                ("АТ", None, None, 1),
+                ("Итого", "100.00", 0, 2),
+            ],
+            ParserDiagnosticCode.MISSING_DEPARTMENT,
+        ),
+        (
+            [
+                ("79.2", None, None, 0),
+                ("АТ", None, None, 1),
+                ("ЦФО: ЦФО", None, None, 2),
+                ("ОВ", "100.00", 0, 4),
+            ],
+            ParserDiagnosticCode.MISSING_SUPPLIER_RVP,
+        ),
+    ],
+)
+def test_financial_payload_on_incomplete_non_leaf_context_blocks(rows, code):
+    result = parse(rows)
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.balances == ()
+    assert any(diagnostic.code is code for diagnostic in result.diagnostics)
 
 
 def test_unlabelled_department_without_organization_blocks_instead_of_promoting_depth():
@@ -326,6 +453,48 @@ def test_unrelated_nearby_side_label_cannot_complete_missing_header():
     assert missing_credit.diagnostics[0].code is ParserDiagnosticCode.MISSING_ENDING_BALANCE_HEADERS
     assert missing_debit.status is BalanceStatus.BLOCKED
     assert missing_debit.diagnostics[0].code is ParserDiagnosticCode.MISSING_ENDING_BALANCE_HEADERS
+
+
+@pytest.mark.parametrize(
+    "first_side,unrelated_side,second_unrelated_side",
+    [("Дебет", "Кредит", "Дебет"), ("Кредит", "Дебет", "Кредит")],
+)
+def test_unmerged_header_children_are_anchored_to_the_semantic_parent(
+    first_side, unrelated_side, second_unrelated_side
+):
+    workbook = make_workbook(leaf("79.2", "АТ", "ЦФО", "Поставщик", "1.00"))
+    worksheet = workbook.active
+    worksheet.unmerge_cells("H4:I4")
+    worksheet["H4"] = "Сальдо на конец периода"
+    worksheet["H5"] = first_side
+    worksheet["I5"] = None
+    worksheet["J5"] = unrelated_side
+    worksheet["K5"] = second_unrelated_side
+
+    result = parse_grouped_osv(workbook, period_end=date(2024, 12, 31))
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.diagnostics[0].code is ParserDiagnosticCode.MISSING_ENDING_BALANCE_HEADERS
+
+
+def test_unmerged_header_children_support_one_column_shift():
+    workbook = make_workbook(leaf("79.2", "АТ", "ЦФО", "Поставщик", "1.00"))
+    worksheet = workbook.active
+    worksheet.unmerge_cells("H4:I4")
+    worksheet["H4"] = "Сальдо на конец периода"
+    worksheet["H5"] = None
+    worksheet["I5"] = "Дебет"
+    worksheet["J5"] = "Кредит"
+    for row in range(6, worksheet.max_row + 1):
+        worksheet.cell(row, 10).value = worksheet.cell(row, 9).value
+        worksheet.cell(row, 9).value = worksheet.cell(row, 8).value
+        worksheet.cell(row, 8).value = None
+
+    result = parse_grouped_osv(workbook, period_end=date(2024, 12, 31))
+
+    assert result.status is BalanceStatus.ACTIONABLE
+    assert len(result.balances) == 1
+    assert result.balances[0].ending_debit == Decimal("1.00")
 
 
 def test_duplicate_coherent_ending_balance_groups_sharing_columns_block():

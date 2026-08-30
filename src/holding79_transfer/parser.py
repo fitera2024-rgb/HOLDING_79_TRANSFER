@@ -402,9 +402,11 @@ def _detect_ending_columns(ws: Worksheet) -> EndingBalanceColumns | ParserDiagno
                         occurrences.append((side, row, column))
         else:
             # An unmerged semantic parent has no span to delimit its group.
-            # Accept only an adjacent Debit/Credit pair on the same child row;
-            # nearby unrelated labels must not complete the group.
-            search_columns = range(min_column, min(ws.max_column, min_column + 3) + 1)
+            # The only defensible child positions are the parent's column or
+            # the one-column-right shifted pair.  A broader search would let
+            # arbitrary adjacent labels elsewhere in the window complete a
+            # malformed group.
+            search_columns = range(min_column, min(ws.max_column, min_column + 2) + 1)
             for row in range(parent_row, search_end + 1):
                 row_occurrences = [
                     (side, row, column)
@@ -605,8 +607,26 @@ def _has_balance_payload(ws: Worksheet, row: int, layout: EndingBalanceColumns) 
             continue
         if isinstance(value, str) and value.strip() in {"", "-", "—", "–"}:
             continue
-        return True
+        try:
+            if _excel_decimal(value) != 0:
+                return True
+        except (TypeError, ValueError):
+            # A non-blank, non-numeric value is still payload: it must not be
+            # silently ignored just because it cannot be normalized.
+            return True
     return False
+
+
+def _missing_context_code(state: _HierarchyState) -> ParserDiagnosticCode | None:
+    if state.account is None:
+        return ParserDiagnosticCode.MISSING_ACCOUNT_CONTEXT
+    if not state.organization:
+        return ParserDiagnosticCode.MISSING_ORGANIZATION
+    if not state.department:
+        return ParserDiagnosticCode.MISSING_DEPARTMENT
+    if not state.supplier_rvp:
+        return ParserDiagnosticCode.MISSING_SUPPLIER_RVP
+    return None
 
 
 def _is_presentation_duplicate(
@@ -614,6 +634,7 @@ def _is_presentation_duplicate(
     previous_row: int,
     current_row: int,
     grouping_column: int,
+    layout: EndingBalanceColumns,
     state: _HierarchyState,
 ) -> bool:
     """Require technical and total rows as evidence of a repeated presentation.
@@ -625,6 +646,18 @@ def _is_presentation_duplicate(
 
     if current_row <= previous_row + 1:
         return False
+    supplier_depth = state.role_depths.get("supplier") if state.role_depths else None
+    previous_depth = _row_depth(ws, previous_row, grouping_column)
+    current_depth = _row_depth(ws, current_row, grouping_column)
+    if (
+        supplier_depth is None
+        or previous_depth is None
+        or current_depth is None
+        or previous_depth != supplier_depth
+        or current_depth != supplier_depth
+    ):
+        return False
+
     has_technical = False
     has_total = False
     for row in range(previous_row + 1, current_row):
@@ -632,16 +665,32 @@ def _is_presentation_duplicate(
             return False
         marker = _role_marker(ws.cell(row, grouping_column).value)
         if marker is None:
+            # Any unlabelled supplier-level row is a real leaf even when its
+            # amount is zero.  A non-zero payload at any other row is also
+            # evidence that this is not one repeated presentation.
+            if _row_depth(ws, row, grouping_column) == supplier_depth and _display_text(
+                ws.cell(row, grouping_column).value
+            ):
+                return False
+            if _has_balance_payload(ws, row, layout):
+                return False
             continue
-        if marker[0] == "technical" and _technical_row_classification(
-            ws,
-            row,
-            grouping_column,
-            state,
-        ) is True:
+        if marker[0] == "technical":
+            if _technical_row_classification(ws, row, grouping_column, state) is not True:
+                return False
+            technical_depth = _row_depth(ws, row, grouping_column)
+            if technical_depth is None or technical_depth <= supplier_depth or has_total:
+                return False
             has_technical = True
-        elif marker[0] == "total":
+        elif marker[0] == "total" and has_technical:
+            total_depth = _row_depth(ws, row, grouping_column)
+            if total_depth is None or total_depth != supplier_depth:
+                return False
             has_total = True
+        else:
+            # An organization, department, supplier, or unknown marker is a
+            # structural boundary, not evidence for the same presentation.
+            return False
     return has_technical and has_total
 
 
@@ -833,10 +882,22 @@ class GroupedOsvParser:
                             grouping_column,
                         )
                     )
+                if _has_balance_payload(ws, row, layout):
+                    diagnostics.append(
+                        _diagnostic(
+                            ParserDiagnosticCode.MISSING_ORGANIZATION
+                            if supported is not None
+                            else ParserDiagnosticCode.MISSING_ACCOUNT_CONTEXT,
+                            "financial payload occurs on an account boundary before a complete hierarchy context",
+                            ws,
+                            row,
+                            grouping_column,
+                        )
+                    )
                 continue
 
             if state.account is None:
-                if _has_balance_payload(ws, row, layout) and _display_text(grouping_value):
+                if _has_balance_payload(ws, row, layout):
                     diagnostics.append(
                         _diagnostic(
                             ParserDiagnosticCode.MISSING_ACCOUNT_CONTEXT,
@@ -850,6 +911,18 @@ class GroupedOsvParser:
 
             marker = _role_marker(grouping_value)
             if marker and marker[0] == "total":
+                if _has_balance_payload(ws, row, layout):
+                    code = _missing_context_code(state)
+                    if code is not None:
+                        diagnostics.append(
+                            _diagnostic(
+                                code,
+                                "financial payload on a total row lacks complete hierarchy context",
+                                ws,
+                                row,
+                                grouping_column,
+                            )
+                        )
                 continue
             if marker and marker[0] == "technical":
                 technical = _technical_row_classification(
@@ -859,6 +932,18 @@ class GroupedOsvParser:
                     state,
                 )
                 if technical is True:
+                    if _has_balance_payload(ws, row, layout):
+                        code = _missing_context_code(state)
+                        if code is not None:
+                            diagnostics.append(
+                                _diagnostic(
+                                    code,
+                                    "financial payload on a technical row lacks complete hierarchy context",
+                                    ws,
+                                    row,
+                                    grouping_column,
+                                )
+                            )
                     continue
                 if technical is None:
                     if _has_balance_payload(ws, row, layout):
@@ -903,6 +988,18 @@ class GroupedOsvParser:
 
             state.set_identity(role, value_or_diagnostic)
             if role != "supplier":
+                if _has_balance_payload(ws, row, layout):
+                    code = _missing_context_code(state)
+                    if code is not None:
+                        diagnostics.append(
+                            _diagnostic(
+                                code,
+                                f"financial payload on a {role} hierarchy row lacks complete context",
+                                ws,
+                                row,
+                                grouping_column,
+                            )
+                        )
                 continue
 
             if not state.organization:
@@ -981,6 +1078,7 @@ class GroupedOsvParser:
                         previous[0],
                         row,
                         grouping_column,
+                        layout,
                         state,
                     )
                 ),
