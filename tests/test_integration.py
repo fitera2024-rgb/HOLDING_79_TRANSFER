@@ -273,6 +273,35 @@ def test_tampered_accepted_transfer_rows_fail_closed_before_publication(
     assert not (tmp_path / "run").exists()
 
 
+def test_omitted_workbook_group_fails_closed_before_publication(tmp_path: Path, monkeypatch):
+    import holding79_transfer.integration as integration_module
+
+    original_validate_artifacts = integration_module._validate_artifacts
+
+    def omit_gk_workbook(root: Path) -> None:
+        manifest_path = root / "export_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        gk_record = next(
+            record for record in manifest["workbooks"] if record["document_organization"] == "ГК"
+        )
+        (root / Path(*gk_record["path"].split("/"))).unlink()
+        manifest["workbooks"] = [
+            record for record in manifest["workbooks"] if record is not gk_record
+        ]
+        assert manifest["financial_row_count"] == 8
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        original_validate_artifacts(root)
+
+    monkeypatch.setattr(integration_module, "_validate_artifacts", omit_gk_workbook)
+
+    with pytest.raises(IntegrationRunError, match="workbook groups do not match PostingRows"):
+        run_synthetic_integration(tmp_path / "run")
+    assert not (tmp_path / "run").exists()
+
+
 def test_financial_record_id_collision_across_source_sheets_fails_closed(tmp_path: Path):
     workbook = build_synthetic_osv_workbook()
     duplicate = workbook.copy_worksheet(workbook["DEBIT_79_2_AT"])

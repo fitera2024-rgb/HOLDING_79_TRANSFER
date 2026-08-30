@@ -1482,6 +1482,9 @@ def _validate_artifacts(root: Path) -> None:
                 "posting_rows.jsonl",
                 f"source reference does not have exactly two PostingRows: {source_ref}",
             )
+    posting_group_counts = Counter(
+        (row.period_end, row.document_organization) for row in posting_rows
+    )
 
     export_manifest = _read_json_artifact(root / "export_manifest.json")
     _require_artifact_keys(
@@ -1528,6 +1531,8 @@ def _validate_artifacts(root: Path) -> None:
         _artifact_failure("input_manifest.json config.adapter", f"invalid adapter config: {exc}")
 
     manifest_export_paths: list[str] = []
+    manifest_group_counts: Counter[tuple[date, str]] = Counter()
+    manifest_export_row_count = 0
     for index, record in enumerate(workbooks):
         label = f"export_manifest.json workbooks[{index}]"
         if not isinstance(record, dict):
@@ -1556,6 +1561,13 @@ def _validate_artifacts(root: Path) -> None:
             _artifact_failure(label, f"unsafe export path: {relative_path}")
         document_organization = _artifact_text(record, "document_organization", label)
         document_date = _artifact_date(record["document_date"], label)
+        group = (document_date, document_organization)
+        if group in manifest_group_counts:
+            _artifact_failure(
+                label,
+                f"duplicate workbook group: {document_date.isoformat()} / {document_organization}",
+            )
+        manifest_group_counts[group] += 1
         if record["sheet_name"] != OUTPUT_SHEET_NAME:
             _artifact_failure(label, "unexpected workbook sheet name")
         if _artifact_int(record, "column_count", label) != len(OUTPUT_HEADERS):
@@ -1581,6 +1593,7 @@ def _validate_artifacts(root: Path) -> None:
         )
         if row_count != len(group_rows):
             _artifact_failure(label, "workbook row count does not match PostingRows group")
+        manifest_export_row_count += row_count
         workbook_path = root / Path(*pure_path.parts)
         if not workbook_path.is_file():
             _artifact_failure(label, f"workbook file is missing: {relative_path}")
@@ -1589,6 +1602,20 @@ def _validate_artifacts(root: Path) -> None:
         except (OSError, TypeError, ValueError, KeyError, XlsxExportError) as exc:
             # Exporter and workbook errors are all fail-closed validation failures.
             _artifact_failure(label, f"workbook round-trip validation failed: {exc}")
+
+    if set(manifest_group_counts) != set(posting_group_counts):
+        missing_groups = sorted(set(posting_group_counts) - set(manifest_group_counts))
+        extra_groups = sorted(set(manifest_group_counts) - set(posting_group_counts))
+        _artifact_failure(
+            "export_manifest.json",
+            f"workbook groups do not match PostingRows: missing={missing_groups!r}, "
+            f"extra={extra_groups!r}",
+        )
+    if manifest_export_row_count != len(posting_rows):
+        _artifact_failure(
+            "export_manifest.json",
+            "sum of workbook financial_row_count values does not match PostingRows",
+        )
 
     actual_export_entries = list(export_root.iterdir())
     if any(entry.is_dir() for entry in actual_export_entries):
