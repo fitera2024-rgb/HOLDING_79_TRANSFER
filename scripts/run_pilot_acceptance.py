@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Run the Issue #13 synthetic pilot acceptance package.
 
 The command deliberately uses only the repository's synthetic workbook.  It
