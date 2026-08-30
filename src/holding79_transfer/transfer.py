@@ -415,7 +415,7 @@ def _direction_is_correct(
 def _is_source_role(balance: NormalizedBalance, row: PostingRow) -> bool:
     """Identify the source-role row by its approved account direction."""
 
-    if row.document_organization != balance.organization or balance.ending_side is None:
+    if balance.ending_side is None:
         return False
     source_account = _source_account_code(balance.source_account)
     manager_account = AccountCode.ACCOUNT_79_1
@@ -433,12 +433,17 @@ def _is_source_role(balance: NormalizedBalance, row: PostingRow) -> bool:
 def _is_gk_role(
     balance: NormalizedBalance, row: PostingRow, config: TransferConfig
 ) -> bool:
-    """Identify the GK-role row by accounts, department, and supplier direction."""
+    """Identify the GK-role row by accounts, department, and supplier direction.
+
+    Document organization is deliberately not used as the role discriminator:
+    the source organization may itself be the configured GK organization.
+    Exact document-organization identity remains part of the full direction
+    validation below.
+    """
 
     manager_account = AccountCode.ACCOUNT_79_1
     if not (
-        row.document_organization == config.manager_organization
-        and row.debit_account is manager_account
+        row.debit_account is manager_account
         and row.credit_account is manager_account
         and row.debit_department == config.manager_financial_department
         and row.credit_department == config.manager_financial_department
