@@ -41,6 +41,7 @@ _SIDE_LABELS = {
     "cr": "credit",
 }
 _ACCOUNT_RE = re.compile(r"\d+(?:\.(?:\d+|\*))+")
+_ACCOUNT_LIKE_RE = re.compile(r"\d+[.,]\d+(?:[.,]\d+)*[A-Za-zА-Яа-я0-9._,*-]*")
 _DATE_RE = re.compile(
     r"(?<!\d)(?P<day>\d{1,2})[./-](?P<month>\d{1,2})[./-](?P<year>\d{4})(?!\d)"
 )
@@ -184,17 +185,19 @@ class _HierarchyState:
     organization: str | None = None
     department: str | None = None
     supplier_rvp: str | None = None
+    account_depth: int = 0
     role_depths: dict[str, int] | None = None
 
     def __post_init__(self) -> None:
         if self.role_depths is None:
             self.role_depths = {}
 
-    def reset_for_account(self, account: SourceAccount | None) -> None:
+    def reset_for_account(self, account: SourceAccount | None, account_depth: int | None = None) -> None:
         self.account = account
         self.organization = None
         self.department = None
         self.supplier_rvp = None
+        self.account_depth = 0 if account_depth is None else account_depth
         self.role_depths = {}
 
     def set_identity(self, role: str, value: str) -> None:
@@ -260,12 +263,25 @@ def _account_token(value: Any) -> str | None:
     if candidate == "79":
         return candidate
     if _ACCOUNT_RE.fullmatch(candidate):
-        # Account rows in the supported scope are 79.x.  Keeping the narrow
-        # prefix here prevents ordinary decimal turnover cells in other ОСВ
-        # columns from being mistaken for account boundaries, while still
-        # surfacing the explicitly unsupported 179.x example as a boundary.
-        if not candidate.startswith(("79.", "179.")):
-            return None
+        return candidate
+    return None
+
+
+def _account_boundary_token(value: Any) -> str | None:
+    """Return supported or unsupported account-like boundary text.
+
+    Account boundaries must be discovered independently of the supported
+    account allow-list.  Otherwise an unsupported account can leave the
+    previous 79.x context active and leak rows into the financial output.
+    """
+
+    token = _account_token(value)
+    if token is not None:
+        return token
+    text = _display_text(value)
+    match = re.fullmatch(r"(?:счет|account)\s*(?:№|:)?\s*(.+)", text, re.IGNORECASE)
+    candidate = match.group(1).strip() if match else text
+    if _ACCOUNT_LIKE_RE.fullmatch(candidate):
         return candidate
     return None
 
@@ -348,7 +364,7 @@ def _source_row_ref(sheet_name: str, row: int) -> str:
 
 
 def _detect_ending_columns(ws: Worksheet) -> EndingBalanceColumns | ParserDiagnostic:
-    parents: list[tuple[int, int, int, int, Any]] = []
+    parents: list[tuple[int, int, int, Any, bool]] = []
     for row in range(1, ws.max_row + 1):
         for column in range(1, ws.max_column + 1):
             value = ws.cell(row, column).value
@@ -364,58 +380,77 @@ def _detect_ending_columns(ws: Worksheet) -> EndingBalanceColumns | ParserDiagno
                     span = merged
                     break
             if span is None:
-                parents.append((row, column, column, row, value))
+                parents.append((row, column, column, value, False))
             elif (row, column) == (span.min_row, span.min_col):
-                parents.append((row, span.min_col, span.max_col, span.max_row, value))
+                parents.append((row, span.min_col, span.max_col, value, True))
 
-    candidates: set[tuple[int, int, tuple[int, ...]]] = set()
-    for parent_row, min_column, max_column, _, parent_value in parents:
+    candidates: list[tuple[int, int, tuple[int, ...]]] = []
+    incomplete_group = False
+    for parent_row, min_column, max_column, parent_value, merged in parents:
+        occurrences: list[tuple[str, int, int]] = []
         direct_side = _side_in_text(parent_value)
-        debit_columns: set[int] = set()
-        credit_columns: set[int] = set()
-        if direct_side == "debit":
-            debit_columns.add(min_column)
-        elif direct_side == "credit":
-            credit_columns.add(min_column)
+        if direct_side is not None:
+            occurrences.append((direct_side, parent_row, min_column))
 
-        search_min = min_column
-        search_max = min(ws.max_column, max_column + 3)
         search_end = min(ws.max_row, parent_row + 4)
-        for row in range(parent_row, search_end + 1):
-            for column in range(search_min, search_max + 1):
-                side = _side_label(_display_text(ws.cell(row, column).value))
-                if side == "debit":
-                    debit_columns.add(column)
-                elif side == "credit":
-                    credit_columns.add(column)
+        if merged:
+            search_columns = range(min_column, max_column + 1)
+            for row in range(parent_row, search_end + 1):
+                for column in search_columns:
+                    side = _side_label(_display_text(ws.cell(row, column).value))
+                    if side is not None:
+                        occurrences.append((side, row, column))
+        else:
+            # An unmerged semantic parent has no span to delimit its group.
+            # Accept only an adjacent Debit/Credit pair on the same child row;
+            # nearby unrelated labels must not complete the group.
+            search_columns = range(min_column, min(ws.max_column, min_column + 3) + 1)
+            for row in range(parent_row, search_end + 1):
+                row_occurrences = [
+                    (side, row, column)
+                    for column in search_columns
+                    if (side := _side_label(_display_text(ws.cell(row, column).value)))
+                    is not None
+                ]
+                occurrences.extend(row_occurrences)
 
-        for debit_column in debit_columns:
-            for credit_column in credit_columns:
+        debit_occurrences = [item for item in occurrences if item[0] == "debit"]
+        credit_occurrences = [item for item in occurrences if item[0] == "credit"]
+        group_candidates: list[tuple[int, int, tuple[int, ...]]] = []
+        for _, debit_row, debit_column in debit_occurrences:
+            for _, credit_row, credit_column in credit_occurrences:
                 if debit_column == credit_column:
                     continue
-                header_rows = {parent_row}
-                for row in range(parent_row, search_end + 1):
-                    if _side_label(_display_text(ws.cell(row, debit_column).value)) == "debit":
-                        header_rows.add(row)
-                    if _side_label(_display_text(ws.cell(row, credit_column).value)) == "credit":
-                        header_rows.add(row)
-                candidates.add((debit_column, credit_column, tuple(sorted(header_rows))))
+                if not merged and (
+                    debit_row != credit_row or abs(debit_column - credit_column) != 1
+                ):
+                    continue
+                group_candidates.append(
+                    (
+                        debit_column,
+                        credit_column,
+                        tuple(sorted({parent_row, debit_row, credit_row})),
+                    )
+                )
 
-    if not candidates:
+        if not group_candidates:
+            incomplete_group = True
+        else:
+            candidates.extend(group_candidates)
+
+    if not candidates or incomplete_group:
         return ParserDiagnostic(
             ParserDiagnosticCode.MISSING_ENDING_BALANCE_HEADERS,
             "missing semantic 'Сальдо на конец периода' Debit/Credit columns",
             ws.title,
         )
-    column_pairs = {(debit, credit) for debit, credit, _ in candidates}
-    if len(column_pairs) != 1:
+    if len(candidates) != 1:
         return ParserDiagnostic(
             ParserDiagnosticCode.AMBIGUOUS_ENDING_BALANCE_HEADERS,
             "ambiguous semantic ending-balance Debit/Credit columns",
             ws.title,
         )
-    debit, credit = next(iter(column_pairs))
-    rows = next(header_rows for d, c, header_rows in candidates if (d, c) == (debit, credit))
+    debit, credit, rows = candidates[0]
     return EndingBalanceColumns(debit, credit, rows)
 
 
@@ -427,7 +462,7 @@ def _find_grouping_column(
         for column in range(1, ws.max_column + 1):
             if column in {layout.debit_column, layout.credit_column}:
                 continue
-            token = _account_token(ws.cell(row, column).value)
+            token = _account_boundary_token(ws.cell(row, column).value)
             if token is not None:
                 previous = _normalize_text(ws.cell(row, column - 1).value) if column > 1 else ""
                 if previous in {"счет", "account"}:
@@ -486,10 +521,41 @@ def _role_marker(value: Any) -> tuple[str, str | None] | None:
     return None
 
 
+def _technical_row_classification(
+    ws: Worksheet,
+    row: int,
+    grouping_column: int,
+    state: _HierarchyState,
+) -> bool | None:
+    """Classify an ОВ/ФВ-like row using hierarchy depth.
+
+    ``True`` means technical, ``False`` means a supplier-level row, and
+    ``None`` means the structure is insufficient to distinguish the two.
+    """
+
+    marker = _role_marker(ws.cell(row, grouping_column).value)
+    if marker is None or marker[0] != "technical":
+        return False
+    depth = _row_depth(ws, row, grouping_column)
+    if depth is None or state.role_depths is None:
+        return None
+    supplier_depth = state.role_depths.get("supplier")
+    if supplier_depth is None:
+        department_depth = state.role_depths.get("department")
+        if department_depth is None:
+            return None
+        supplier_depth = department_depth + 1
+    if depth > supplier_depth:
+        return True
+    if depth == supplier_depth:
+        return False
+    return None
+
+
 def _row_account_token(
     ws: Worksheet, row: int, grouping_column: int, layout: EndingBalanceColumns
 ) -> str | None:
-    token = _account_token(ws.cell(row, grouping_column).value)
+    token = _account_boundary_token(ws.cell(row, grouping_column).value)
     if token is not None:
         return token
     if _normalize_text(ws.cell(row, grouping_column).value) not in {"счет", "account"}:
@@ -497,7 +563,7 @@ def _row_account_token(
     for column in range(grouping_column + 1, ws.max_column + 1):
         if column in {layout.debit_column, layout.credit_column}:
             continue
-        token = _account_token(ws.cell(row, column).value)
+        token = _account_boundary_token(ws.cell(row, column).value)
         if token is not None:
             return token
     return None
@@ -527,7 +593,7 @@ def _identity_candidates(
         if column == grouping_column and marker is None:
             candidates.append(text)
             continue
-        if _role_marker(value) is None and not _account_token(value):
+        if _role_marker(value) is None and not _account_boundary_token(value):
             candidates.append(text)
     return list(dict.fromkeys(candidates))
 
@@ -543,6 +609,42 @@ def _has_balance_payload(ws: Worksheet, row: int, layout: EndingBalanceColumns) 
     return False
 
 
+def _is_presentation_duplicate(
+    ws: Worksheet,
+    previous_row: int,
+    current_row: int,
+    grouping_column: int,
+    state: _HierarchyState,
+) -> bool:
+    """Require technical and total rows as evidence of a repeated presentation.
+
+    Equal business values alone are insufficient: two supplier leaves may be
+    legitimate separate source rows.  The current supported presentation has
+    an ОВ/ФВ detail and a following total between repeated leaf rows.
+    """
+
+    if current_row <= previous_row + 1:
+        return False
+    has_technical = False
+    has_total = False
+    for row in range(previous_row + 1, current_row):
+        if _account_boundary_token(ws.cell(row, grouping_column).value) is not None:
+            return False
+        marker = _role_marker(ws.cell(row, grouping_column).value)
+        if marker is None:
+            continue
+        if marker[0] == "technical" and _technical_row_classification(
+            ws,
+            row,
+            grouping_column,
+            state,
+        ) is True:
+            has_technical = True
+        elif marker[0] == "total":
+            has_total = True
+    return has_technical and has_total
+
+
 def _excel_decimal(value: Any) -> Decimal:
     """Normalize Excel's numeric/string forms without binary arithmetic."""
 
@@ -556,12 +658,10 @@ def _excel_decimal(value: Any) -> Decimal:
 
 
 def _normalized_ending_pair(debit: Decimal, credit: Decimal) -> tuple[Decimal, Decimal]:
-    """Flip a single negative-side representation into canonical non-negative sides."""
+    """Preserve explicit sides without inferring accounting direction."""
 
-    if debit < 0 and credit == 0:
-        return Decimal(0), -debit
-    if credit < 0 and debit == 0:
-        return -credit, Decimal(0)
+    if debit < 0 or credit < 0:
+        raise ValueError("negative ending balances are unsupported")
     return debit, credit
 
 
@@ -711,7 +811,7 @@ class GroupedOsvParser:
         state = _HierarchyState()
         balances: list[NormalizedBalance] = []
         diagnostics: list[ParserDiagnostic] = []
-        seen_source_keys: dict[tuple[Any, ...], tuple[int, Decimal, Decimal]] = {}
+        seen_source_keys: dict[tuple[Any, ...], list[tuple[int, Decimal, Decimal]]] = {}
         start_row = layout.header_rows[-1] + 1
 
         for row in range(start_row, ws.max_row + 1):
@@ -719,7 +819,10 @@ class GroupedOsvParser:
             account = _row_account_token(ws, row, grouping_column, layout)
             if account is not None:
                 supported = _supported_account(account)
-                state.reset_for_account(supported)
+                state.reset_for_account(
+                    supported,
+                    _row_depth(ws, row, grouping_column),
+                )
                 if supported is None:
                     diagnostics.append(
                         _diagnostic(
@@ -746,8 +849,29 @@ class GroupedOsvParser:
                 continue
 
             marker = _role_marker(grouping_value)
-            if marker and marker[0] in {"technical", "total"}:
+            if marker and marker[0] == "total":
                 continue
+            if marker and marker[0] == "technical":
+                technical = _technical_row_classification(
+                    ws,
+                    row,
+                    grouping_column,
+                    state,
+                )
+                if technical is True:
+                    continue
+                if technical is None:
+                    if _has_balance_payload(ws, row, layout):
+                        diagnostics.append(
+                            _diagnostic(
+                                ParserDiagnosticCode.AMBIGUOUS_HIERARCHY,
+                                "ОВ/ФВ-like row cannot be distinguished from a supplier leaf",
+                                ws,
+                                row,
+                                grouping_column,
+                            )
+                        )
+                    continue
             if not _display_text(grouping_value) and not _has_balance_payload(ws, row, layout):
                 continue
 
@@ -818,6 +942,16 @@ class GroupedOsvParser:
             try:
                 debit = _excel_decimal(ws.cell(row, layout.debit_column).value)
                 credit = _excel_decimal(ws.cell(row, layout.credit_column).value)
+                if debit < 0 or credit < 0:
+                    diagnostics.append(
+                        _diagnostic(
+                            ParserDiagnosticCode.INVALID_ENDING_BALANCE,
+                            "negative ending balances are unsupported; accounting side was not inferred",
+                            ws,
+                            row,
+                        )
+                    )
+                    continue
                 debit, credit = _normalized_ending_pair(debit, credit)
             except (TypeError, ValueError) as exc:
                 diagnostics.append(
@@ -837,17 +971,29 @@ class GroupedOsvParser:
                 state.department,
                 state.supplier_rvp,
             )
-            previous = seen_source_keys.get(source_key)
-            if previous is not None:
-                previous_row, previous_debit, previous_credit = previous
+            previous_rows = seen_source_keys.get(source_key, [])
+            presentation_previous = next(
+                (
+                    previous
+                    for previous in reversed(previous_rows)
+                    if _is_presentation_duplicate(
+                        ws,
+                        previous[0],
+                        row,
+                        grouping_column,
+                        state,
+                    )
+                ),
+                None,
+            )
+            if presentation_previous is not None:
+                previous_row, previous_debit, previous_credit = presentation_previous
                 if (previous_debit, previous_credit) == (debit, credit):
-                    # Identical supplier rows are presentation duplicates.  A
-                    # differing amount is never silently aggregated or chosen.
                     continue
                 diagnostics.append(
                     _diagnostic(
                         ParserDiagnosticCode.DUPLICATE_SOURCE_ROW,
-                        "the same supplier identity has conflicting source rows "
+                        "the same presentation source identity has conflicting rows "
                         f"at rows {previous_row} and {row}",
                         ws,
                         row,
@@ -887,7 +1033,7 @@ class GroupedOsvParser:
                     )
                 )
                 continue
-            seen_source_keys[source_key] = (row, debit, credit)
+            seen_source_keys.setdefault(source_key, []).append((row, debit, credit))
             balances.append(balance)
 
         if diagnostics:
@@ -911,27 +1057,64 @@ class GroupedOsvParser:
         marker = _role_marker(grouping_value)
         if marker is not None:
             role, marker_value = marker
-            if role in {"technical", "total"}:
+            if role == "total":
                 return None, None
-            if marker_value is None:
-                candidates = _identity_candidates(ws, row, grouping_column, layout, role)
-                if len(candidates) == 1:
-                    marker_value = candidates[0]
-                elif len(candidates) > 1:
-                    code = {
-                        "organization": ParserDiagnosticCode.AMBIGUOUS_ORGANIZATION,
-                        "department": ParserDiagnosticCode.AMBIGUOUS_DEPARTMENT,
-                        "supplier": ParserDiagnosticCode.AMBIGUOUS_SUPPLIER_RVP,
-                    }[role]
+            if role != "technical":
+                if role == "department" and not state.organization:
                     return role, _diagnostic(
-                        code,
-                        f"ambiguous {role} identity candidates: {candidates}",
+                        ParserDiagnosticCode.MISSING_ORGANIZATION,
+                        "department row occurs before an organization context",
                         ws,
                         row,
                         grouping_column,
                     )
-            self._record_role_depth(state, role, _row_depth(ws, row, grouping_column))
-            return role, marker_value
+                if role == "supplier":
+                    if not state.organization:
+                        return role, _diagnostic(
+                            ParserDiagnosticCode.MISSING_ORGANIZATION,
+                            "supplier row occurs before an organization context",
+                            ws,
+                            row,
+                            grouping_column,
+                        )
+                    if not state.department:
+                        return role, _diagnostic(
+                            ParserDiagnosticCode.MISSING_DEPARTMENT,
+                            "supplier row occurs before a department context",
+                            ws,
+                            row,
+                            grouping_column,
+                        )
+                if marker_value is None:
+                    candidates = _identity_candidates(ws, row, grouping_column, layout, role)
+                    if len(candidates) == 1:
+                        marker_value = candidates[0]
+                    elif len(candidates) > 1:
+                        code = {
+                            "organization": ParserDiagnosticCode.AMBIGUOUS_ORGANIZATION,
+                            "department": ParserDiagnosticCode.AMBIGUOUS_DEPARTMENT,
+                            "supplier": ParserDiagnosticCode.AMBIGUOUS_SUPPLIER_RVP,
+                        }[role]
+                        return role, _diagnostic(
+                            code,
+                            f"ambiguous {role} identity candidates: {candidates}",
+                            ws,
+                            row,
+                            grouping_column,
+                        )
+                depth = _row_depth(ws, row, grouping_column)
+                depth_diagnostic = self._validate_role_depth(
+                    ws,
+                    row,
+                    grouping_column,
+                    state,
+                    role,
+                    depth,
+                )
+                if depth_diagnostic is not None:
+                    return role, depth_diagnostic
+                self._record_role_depth(state, role, depth)
+                return role, marker_value
 
         value = _display_text(grouping_value)
         depth = _row_depth(ws, row, grouping_column)
@@ -944,6 +1127,16 @@ class GroupedOsvParser:
                 row,
                 grouping_column,
             )
+        depth_diagnostic = self._validate_role_depth(
+            ws,
+            row,
+            grouping_column,
+            state,
+            role,
+            depth,
+        )
+        if depth_diagnostic is not None:
+            return role, depth_diagnostic
         self._record_role_depth(state, role, depth)
         if value:
             return role, value
@@ -975,12 +1168,64 @@ class GroupedOsvParser:
             state.role_depths[role] = depth
 
     @staticmethod
+    def _validate_role_depth(
+        ws: Worksheet,
+        row: int,
+        grouping_column: int,
+        state: _HierarchyState,
+        role: str,
+        depth: int | None,
+    ) -> ParserDiagnostic | None:
+        if depth is None or state.role_depths is None:
+            return None
+        known_depth = state.role_depths.get(role)
+        if known_depth is not None and known_depth != depth:
+            return _diagnostic(
+                ParserDiagnosticCode.AMBIGUOUS_HIERARCHY,
+                f"{role} row depth {depth} conflicts with established depth {known_depth}",
+                ws,
+                row,
+                grouping_column,
+            )
+        if role == "organization" and depth <= state.account_depth:
+            return _diagnostic(
+                ParserDiagnosticCode.AMBIGUOUS_HIERARCHY,
+                "organization row does not follow the account hierarchy level",
+                ws,
+                row,
+                grouping_column,
+            )
+        parent_role = {
+            "department": "organization",
+            "supplier": "department",
+        }.get(role)
+        if parent_role is not None:
+            parent_depth = state.role_depths.get(parent_role)
+            if parent_depth is not None and depth <= parent_depth:
+                return _diagnostic(
+                    ParserDiagnosticCode.AMBIGUOUS_HIERARCHY,
+                    f"{role} row does not follow the {parent_role} hierarchy level",
+                    ws,
+                    row,
+                    grouping_column,
+                )
+        return None
+
+    @staticmethod
     def _role_from_depth(state: _HierarchyState, depth: int | None) -> str | None:
         if not state.organization:
+            if depth is None or depth != state.account_depth + 1:
+                return None
             return "organization"
         if not state.department:
+            organization_depth = state.role_depths.get("organization") if state.role_depths else None
+            if organization_depth is None or depth is None or depth != organization_depth + 1:
+                return None
             return "department"
         if not state.supplier_rvp:
+            department_depth = state.role_depths.get("department") if state.role_depths else None
+            if department_depth is None or depth is None or depth != department_depth + 1:
+                return None
             return "supplier"
         if depth is not None and state.role_depths:
             known = state.role_depths.get("supplier")
@@ -993,10 +1238,9 @@ class GroupedOsvParser:
             if department_depth is not None and depth == department_depth:
                 return "department"
             return None
-        # With no depth metadata, a subsequent unlabelled row is another
-        # supplier in the same department.  Organization and department
-        # boundaries must carry an explicit marker or a depth change.
-        return "supplier"
+        # Without depth metadata an unlabelled row cannot safely distinguish a
+        # supplier from a new organization or department boundary.
+        return None
 
 
 def parse_grouped_osv(

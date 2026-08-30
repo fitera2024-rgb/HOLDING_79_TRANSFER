@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 
+import pytest
 from openpyxl import Workbook
 from openpyxl.styles import Alignment
 
@@ -151,6 +152,71 @@ def test_account_boundary_resets_stale_context_and_missing_context_blocks():
     assert result.diagnostics[0].code is ParserDiagnosticCode.MISSING_ORGANIZATION
 
 
+def test_unlabelled_department_without_organization_blocks_instead_of_promoting_depth():
+    rows = [
+        ("79.2", None, None, 0),
+        ("Department-looking row", None, None, 2),
+        ("Supplier-1", "1.00", 0, 3),
+        ("Supplier-2", "2.00", 0, 3),
+    ]
+
+    result = parse(rows)
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.balances == ()
+    assert any(
+        diagnostic.code is ParserDiagnosticCode.AMBIGUOUS_HIERARCHY
+        for diagnostic in result.diagnostics
+    )
+
+
+def test_new_unlabelled_organization_without_department_does_not_reuse_old_department():
+    rows = [
+        ("79.2", None, None, 0),
+        ("Organization-A", None, None, 1),
+        ("Department-A", None, None, 2),
+        ("Supplier-A", "1.00", 0, 3),
+        ("Organization-B", None, None, 1),
+        ("Supplier-B", "2.00", 0, 3),
+    ]
+
+    result = parse(rows)
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.balances == ()
+    assert any(
+        diagnostic.code is ParserDiagnosticCode.AMBIGUOUS_HIERARCHY
+        for diagnostic in result.diagnostics
+    )
+
+
+def test_missing_depth_metadata_blocks_unlabelled_supplier_boundary():
+    rows = leaf("79.2", "АТ", "ЦФО", "Поставщик-1", "1.00")
+    rows += [("Поставщик-2", "2.00", 0, None)]
+
+    result = parse(rows)
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.balances == ()
+    assert result.diagnostics[-1].code is ParserDiagnosticCode.AMBIGUOUS_HIERARCHY
+
+
+def test_wrong_hierarchy_depth_sequence_blocks_value_bearing_row():
+    rows = [
+        ("79.2", None, None, 0),
+        ("Organization-A", None, None, 1),
+        ("Department-A", None, None, 2),
+        ("Supplier-A", "1.00", 0, 3),
+        ("Wrong-depth-row", "2.00", 0, 4),
+    ]
+
+    result = parse(rows)
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.balances == ()
+    assert result.diagnostics[-1].code is ParserDiagnosticCode.AMBIGUOUS_HIERARCHY
+
+
 def test_blank_supplier_and_ambiguous_identity_are_blocked():
     blank = parse(leaf("79.2", "АТ", "ЦФО", "", "1.00"))
     assert blank.status is BalanceStatus.BLOCKED
@@ -167,12 +233,32 @@ def test_blank_supplier_and_ambiguous_identity_are_blocked():
     assert ambiguous.diagnostics[0].code is ParserDiagnosticCode.AMBIGUOUS_ORGANIZATION
 
 
-def test_unsupported_account_is_not_accepted_or_inherited():
-    result = parse(leaf("79.20", "АТ", "ЦФО", "Поставщик", "1.00"))
+@pytest.mark.parametrize(
+    "supported,unsupported",
+    [
+        ("79.2", "80.1"),
+        ("79.2", "79.4"),
+        ("79.3", "62.1"),
+        ("79.3", "179.2"),
+        ("79.2", "79.2x"),
+    ],
+)
+def test_unsupported_account_is_not_accepted_or_inherited(supported, unsupported):
+    rows = leaf(supported, "АТ", "ЦФО", "До границы", "1.00")
+    rows += [
+        (unsupported, None, None, 0),
+        ("Организация: АТ-unsupported", None, None, 1),
+        ("ЦФО: ЦФО-unsupported", None, None, 2),
+        ("Поставщик РВП: После границы", "2.00", 0, 3),
+    ]
+    result = parse(rows)
 
     assert result.status is BalanceStatus.BLOCKED
     assert result.balances == ()
-    assert result.diagnostics[0].code is ParserDiagnosticCode.UNSUPPORTED_ACCOUNT
+    assert any(
+        diagnostic.code is ParserDiagnosticCode.UNSUPPORTED_ACCOUNT
+        for diagnostic in result.diagnostics
+    )
 
 
 def test_semantic_header_detection_is_independent_of_header_row_number():
@@ -215,6 +301,47 @@ def test_missing_or_ambiguous_ending_balance_headers_block():
     assert ambiguous.diagnostics[0].code is ParserDiagnosticCode.AMBIGUOUS_ENDING_BALANCE_HEADERS
 
 
+def test_unrelated_nearby_side_label_cannot_complete_missing_header():
+    missing_credit_workbook = make_workbook(
+        leaf("79.2", "АТ", "ЦФО", "Поставщик", "1.00")
+    )
+    missing_credit_workbook.active["I5"] = None
+    missing_credit_workbook.active["J5"] = "Кредит"
+    missing_credit = parse_grouped_osv(
+        missing_credit_workbook,
+        period_end=date(2024, 12, 31),
+    )
+
+    missing_debit_workbook = make_workbook(
+        leaf("79.2", "АТ", "ЦФО", "Поставщик", "1.00")
+    )
+    missing_debit_workbook.active["H5"] = None
+    missing_debit_workbook.active["J5"] = "Дебет"
+    missing_debit = parse_grouped_osv(
+        missing_debit_workbook,
+        period_end=date(2024, 12, 31),
+    )
+
+    assert missing_credit.status is BalanceStatus.BLOCKED
+    assert missing_credit.diagnostics[0].code is ParserDiagnosticCode.MISSING_ENDING_BALANCE_HEADERS
+    assert missing_debit.status is BalanceStatus.BLOCKED
+    assert missing_debit.diagnostics[0].code is ParserDiagnosticCode.MISSING_ENDING_BALANCE_HEADERS
+
+
+def test_duplicate_coherent_ending_balance_groups_sharing_columns_block():
+    workbook = make_workbook(leaf("79.2", "АТ", "ЦФО", "Поставщик", "1.00"))
+    worksheet = workbook.active
+    worksheet.merge_cells("H12:I12")
+    worksheet["H12"] = "Сальдо на конец периода"
+    worksheet["H13"] = "Дебет"
+    worksheet["I13"] = "Кредит"
+
+    result = parse_grouped_osv(workbook, period_end=date(2024, 12, 31))
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.diagnostics[0].code is ParserDiagnosticCode.AMBIGUOUS_ENDING_BALANCE_HEADERS
+
+
 def test_source_row_reference_is_stable_and_path_independent():
     first = parse(leaf("79.2", "АТ", "ЦФО", "Поставщик", "1.00"))
     second = parse(leaf("79.2", "АТ", "ЦФО", "Поставщик", "1.00"))
@@ -229,10 +356,85 @@ def test_decimal_safe_service_and_negative_representations_are_normalized():
     assert result.balances[0].ending_debit == Decimal("1234.50")
 
     negative = parse(leaf("79.3", "АТ", "ЦФО", "Поставщик", "-7.25"))
-    assert negative.status is BalanceStatus.ACTIONABLE
-    assert negative.balances[0].ending_debit == Decimal(0)
-    assert negative.balances[0].ending_credit == Decimal("7.25")
+    assert negative.status is BalanceStatus.BLOCKED
+    assert negative.balances == ()
+    assert negative.diagnostics[0].code is ParserDiagnosticCode.INVALID_ENDING_BALANCE
 
     both_sides = parse(leaf("79.3", "АТ", "ЦФО", "Поставщик", "7.25", "1.00"))
     assert both_sides.status is BalanceStatus.BLOCKED
     assert both_sides.diagnostics[0].code is ParserDiagnosticCode.INVALID_ENDING_BALANCE
+
+
+@pytest.mark.parametrize("debit,credit", [("-100", 0), (0, "-100"), ("(100)", 0), (0, "(100)")])
+def test_negative_ending_values_are_blocked_without_side_inference(debit, credit):
+    result = parse(leaf("79.2", "АТ", "ЦФО", "Поставщик", debit, credit))
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.balances == ()
+    assert result.diagnostics[0].code is ParserDiagnosticCode.INVALID_ENDING_BALANCE
+
+
+def test_equal_business_values_in_distinct_supplier_rows_are_preserved():
+    rows = [
+        ("79.2", None, None, 0),
+        ("АТ", None, None, 1),
+        ("Department A", None, None, 2),
+        ("Поставщик", "1.00", 0, 3),
+        ("Поставщик", "1.00", 0, 3),
+    ]
+
+    result = parse(rows)
+
+    assert result.status is BalanceStatus.ACTIONABLE
+    assert len(result.balances) == 2
+    assert [balance.source_excel_row_ref for balance in result.balances] == [
+        "ОСВ!R9",
+        "ОСВ!R10",
+    ]
+
+
+def test_conflicting_presentation_duplicate_is_blocked():
+    rows = leaf("79.2", "АТ", "ЦФО", "Производитель", "10.00")
+    rows += [
+        ("ОВ", "10.00", 0, 4),
+        ("ФВ", "10.00", 0, 4),
+        ("Итого по поставщику", "10.00", 0, 3),
+        ("Поставщик РВП: Производитель", "11.00", 0, 3),
+    ]
+
+    result = parse(rows)
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.balances == ()
+    assert result.diagnostics[0].code is ParserDiagnosticCode.DUPLICATE_SOURCE_ROW
+
+
+@pytest.mark.parametrize("supplier", ["ОВ", "ФВ", "ОВ-Company", "ФВ-Company"])
+def test_supplier_names_similar_to_technical_rows_are_preserved(supplier):
+    result = parse(
+        [
+            ("79.2", None, None, 0),
+            ("АТ", None, None, 1),
+            ("Department A", None, None, 2),
+            (supplier, "1.00", 0, 3),
+        ]
+    )
+
+    assert result.status is BalanceStatus.ACTIONABLE
+    assert len(result.balances) == 1
+    assert result.balances[0].supplier_rvp == supplier
+
+
+def test_ambiguous_ov_fv_without_structural_depth_blocks():
+    result = parse(
+        [
+            ("79.2", None, None, 0),
+            ("АТ", None, None, 1),
+            ("Department A", None, None, 2),
+            ("ОВ", "1.00", 0, None),
+        ]
+    )
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.balances == ()
+    assert result.diagnostics[0].code is ParserDiagnosticCode.AMBIGUOUS_HIERARCHY
