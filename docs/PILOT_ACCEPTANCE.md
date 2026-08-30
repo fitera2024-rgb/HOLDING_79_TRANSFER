@@ -39,10 +39,12 @@ From the repository root, use a clean output directory:
 `python scripts/run_pilot_acceptance.py --output-dir .pilot-acceptance`
 
 The command verifies that the accepted base SHA is an ancestor of the current
-build HEAD, then returns zero and prints `ACCEPTANCE=PASS` only after all mandatory
-controls, malformed-source probes, atomicity checks, and the deterministic
-rerun comparison pass. Any mandatory failure returns nonzero and no successful
-acceptance directory is published.
+build HEAD when the commit is available locally. In a shallow GitHub PR
+checkout, it verifies the workflow base ref is `main` without fetching or
+mutating the checkout. It then returns zero and prints `ACCEPTANCE=PASS` only
+after all mandatory controls, malformed-source probes, atomicity checks, and
+the deterministic rerun comparison pass. Any mandatory failure returns
+nonzero and no successful acceptance directory is published.
 
 ## Successful artifact set
 

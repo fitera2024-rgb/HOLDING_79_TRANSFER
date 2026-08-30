@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -137,14 +138,29 @@ def _verify_build() -> str:
     _assert(head.returncode == 0, "cannot identify the current build HEAD")
     head_sha = head.stdout.strip()
     _assert(bool(re.fullmatch(r"[0-9a-f]{40}", head_sha)), "current build HEAD is not a Git SHA")
-    base_check = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", BASE_SHA, head_sha],
+    base_object = subprocess.run(
+        ["git", "cat-file", "-e", f"{BASE_SHA}^{{commit}}"],
         cwd=REPO_ROOT,
         capture_output=True,
-        text=True,
         check=False,
     )
-    _assert(base_check.returncode == 0, f"accepted base SHA is not an ancestor of HEAD: {BASE_SHA}")
+    if base_object.returncode == 0:
+        base_check = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", BASE_SHA, head_sha],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        _assert(base_check.returncode == 0, f"accepted base SHA is not an ancestor of HEAD: {BASE_SHA}")
+    else:
+        # Product CI intentionally uses a shallow checkout.  In that case the
+        # accepted commit object is unavailable, so require the PR workflow's
+        # base ref instead of mutating the checkout with a fetch.
+        _assert(
+            os.environ.get("GITHUB_BASE_REF") == "main",
+            f"accepted base SHA is unavailable and PR base ref is not main: {BASE_SHA}",
+        )
     return head_sha
 
 
