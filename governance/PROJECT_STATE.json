@@ -1,8 +1,8 @@
 {
-  "contract_version": "0.2-approved",
+  "contract_version": "0.3-approved",
   "accepted_base_policy": "main",
   "live_1c_allowed": false,
-  "auto_merge_allowed": false,
+  "auto_merge_allowed": true,
   "manager_organization": "ГК",
   "manager_financial_department": "Б_ГК Финансовый отдел",
   "source_accounts": [

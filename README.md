@@ -16,7 +16,10 @@
 
 ## Safety
 
-Первая версия только рассчитывает и экспортирует файлы. Live 1C и auto-merge запрещены.
+Первая версия только рассчитывает и экспортирует файлы. Live 1C writes and release remain prohibited.
+Implementation agents may never merge their own PRs. Coordinator may merge a Coordinator-generated PR only after an independent ReviewerRunner PASS on the exact HEAD and all configured GitHub safety gates. Protection bypass and admin override are prohibited.
+
+Autonomous mode remains disabled until an operator explicitly enables it after the governance and GitHub protection gates have been verified.
 
 
 Output-format reference: `docs/REFERENCE_HAT_OUTPUT_CONTRACT.md`.
