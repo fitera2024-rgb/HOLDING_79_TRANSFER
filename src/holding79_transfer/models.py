@@ -17,7 +17,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-CONTRACT_VERSION = "0.2-approved"
+CONTRACT_VERSION = "0.3-approved"
 RULES_VERSION = "H79_TRANSFER_V1"
 DEBIT_RULE_ID = "H79_DEBIT_TRANSFER_V1"
 CREDIT_RULE_ID = "H79_CREDIT_TRANSFER_V1"
