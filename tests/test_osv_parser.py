@@ -12,9 +12,11 @@ from openpyxl.styles import Alignment
 from holding79_transfer import (
     BalanceStatus,
     GroupedOsvParser,
+    ParserDiagnostic,
     ParserDiagnosticCode,
     parse_grouped_osv,
 )
+from holding79_transfer.parser import _detect_ending_columns, _find_grouping_column
 
 
 def make_workbook(
@@ -569,6 +571,153 @@ def test_account_label_and_exact_account_value_can_share_grouping_columns():
     assert result.status is BalanceStatus.ACTIONABLE
     assert result.balances[0].source_account.value == "79.2"
     assert result.balances[0].organization == "АТ"
+
+
+def make_structured_measure_workbook(*, grouping_column: int = 1) -> Workbook:
+    """Build an actual-shape grouped OSV with several numeric sections."""
+
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "ОСВ"
+    worksheet.merge_cells("E8:F8")
+    worksheet["E8"] = "Сальдо на начало периода"
+    worksheet["E9"] = "Дебет"
+    worksheet["F9"] = "Кредит"
+    worksheet.merge_cells("G8:H8")
+    worksheet["G8"] = "Обороты за период"
+    worksheet["G9"] = "Дебет"
+    worksheet["H9"] = "Кредит"
+    worksheet.merge_cells("I8:J8")
+    worksheet["I8"] = "Обороты за период 2"
+    worksheet["I9"] = "Дебет"
+    worksheet["J9"] = "Кредит"
+    worksheet.merge_cells("K8:L8")
+    worksheet["K8"] = "Сальдо на конец периода"
+    worksheet["K9"] = "Дебет"
+    worksheet["L9"] = "Кредит"
+
+    rows = [
+        (79.2, 1.20, 79.30, 62.10, 179.20, 0, 0, 0),
+        ("Организация: Synthetic Org", 2.25, 0, 0, 0, 0, 0, 0),
+        ("ЦФО: Synthetic Department", 0, 3.50, 0, 0, 0, 0, 0),
+        ("Поставщик РВП: Synthetic Supplier", 0, 0, 4.75, 0, 10.00, 0, 0),
+    ]
+    for row, values in enumerate(rows, 10):
+        worksheet.cell(row, grouping_column).value = values[0]
+        worksheet.cell(row, grouping_column).alignment = Alignment(
+            indent=min(row - 10, 3)
+        )
+        for column, value in zip((5, 7, 9, 10, 11, 12, 6, 8), values[1:]):
+            worksheet.cell(row, column).value = value
+    return workbook
+
+
+def test_structural_grouping_ignores_decimal_measure_candidates():
+    workbook = make_structured_measure_workbook()
+    layout = _detect_ending_columns(workbook.active)
+    assert not isinstance(layout, ParserDiagnostic)
+    assert _find_grouping_column(workbook.active, layout) == 1
+
+    result = parse_grouped_osv(workbook, period_end=date(2024, 12, 31))
+
+    assert result.status is BalanceStatus.ACTIONABLE
+    assert len(result.balances) == 1
+    assert result.balances[0].source_account.value == "79.2"
+    assert result.balances[0].organization == "Synthetic Org"
+    assert result.balances[0].department == "Synthetic Department"
+    assert result.balances[0].supplier_rvp == "Synthetic Supplier"
+    assert result.balances[0].ending_debit == Decimal("10.00")
+
+
+def test_shifted_grouping_column_is_detected_from_hierarchy_structure():
+    workbook = make_structured_measure_workbook(grouping_column=3)
+    layout = _detect_ending_columns(workbook.active)
+    assert _find_grouping_column(workbook.active, layout) == 3
+
+    result = parse_grouped_osv(workbook, period_end=date(2024, 12, 31))
+
+    assert result.status is BalanceStatus.ACTIONABLE
+    assert result.balances[0].supplier_rvp == "Synthetic Supplier"
+
+
+def test_outline_only_hierarchy_supports_grouping_column_detection():
+    workbook = make_workbook(
+        [
+            ("79.2", None, None, None),
+            ("Organization-A", None, None, None),
+            ("Department-A", None, None, None),
+            ("Supplier-A", "1.00", 0, None),
+        ]
+    )
+    worksheet = workbook.active
+    for row, outline_level in ((7, 1), (8, 2), (9, 3)):
+        worksheet.row_dimensions[row].outlineLevel = outline_level
+
+    result = parse_grouped_osv(workbook, period_end=date(2024, 12, 31))
+
+    assert result.status is BalanceStatus.ACTIONABLE
+    assert result.diagnostics == ()
+    assert len(result.balances) == 1
+    assert result.balances[0].organization == "Organization-A"
+    assert result.balances[0].department == "Department-A"
+    assert result.balances[0].supplier_rvp == "Supplier-A"
+
+
+def test_outline_hierarchy_excludes_numeric_measure_account_lookalikes():
+    workbook = make_structured_measure_workbook()
+    worksheet = workbook.active
+    worksheet["A11"] = "Organization-A"
+    worksheet["A12"] = "Department-A"
+    worksheet["A13"] = "Supplier-A"
+    for row, outline_level in ((10, 0), (11, 1), (12, 2), (13, 3)):
+        worksheet.cell(row, 1).alignment = Alignment(indent=0)
+        worksheet.row_dimensions[row].outlineLevel = outline_level
+
+    layout = _detect_ending_columns(worksheet)
+    assert not isinstance(layout, ParserDiagnostic)
+    assert _find_grouping_column(worksheet, layout) == 1
+
+    result = parse_grouped_osv(workbook, period_end=date(2024, 12, 31))
+
+    assert result.status is BalanceStatus.ACTIONABLE
+    assert len(result.balances) == 1
+    assert result.balances[0].source_account.value == "79.2"
+    assert result.balances[0].organization == "Organization-A"
+    assert result.balances[0].department == "Department-A"
+    assert result.balances[0].supplier_rvp == "Supplier-A"
+
+
+def test_numeric_measure_value_equal_to_supported_account_is_not_an_account_boundary():
+    workbook = make_structured_measure_workbook()
+    worksheet = workbook.active
+    worksheet["E10"] = 79.2
+    worksheet["G10"] = "1.20"
+    worksheet["I10"] = "79.30"
+    worksheet["J10"] = "62.10"
+
+    layout = _detect_ending_columns(worksheet)
+    assert not isinstance(layout, ParserDiagnostic)
+    assert _find_grouping_column(worksheet, layout) == 1
+    result = parse_grouped_osv(workbook, period_end=date(2024, 12, 31))
+
+    assert result.status is BalanceStatus.ACTIONABLE
+    assert len(result.balances) == 1
+
+
+def test_two_structurally_plausible_grouping_columns_remain_ambiguous():
+    workbook = make_structured_measure_workbook()
+    worksheet = workbook.active
+    for row in range(10, 14):
+        worksheet.cell(row, 3).value = worksheet.cell(row, 1).value
+        worksheet.cell(row, 3).alignment = Alignment(indent=min(row - 10, 3))
+
+    layout = _detect_ending_columns(worksheet)
+    grouping = _find_grouping_column(worksheet, layout)
+
+    assert grouping.code is ParserDiagnosticCode.AMBIGUOUS_ACCOUNT_CONTEXT
+    result = parse_grouped_osv(workbook, period_end=date(2024, 12, 31))
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.diagnostics[0].code is ParserDiagnosticCode.AMBIGUOUS_ACCOUNT_CONTEXT
 
 
 def test_missing_or_ambiguous_ending_balance_headers_block():

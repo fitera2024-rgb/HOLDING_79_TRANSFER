@@ -33,6 +33,14 @@ from .models import (
 )
 
 _END_BALANCE_HEADER = "сальдо на конец периода"
+_MEASURE_HEADER_MARKERS = (
+    "сальдо",
+    "оборот",
+    "остаток",
+    "opening balance",
+    "turnover",
+    "ending balance",
+)
 _SIDE_LABELS = {
     "дебет": "debit",
     "дт": "debit",
@@ -483,25 +491,126 @@ def _detect_ending_columns(ws: Worksheet) -> EndingBalanceColumns | ParserDiagno
     return EndingBalanceColumns(debit, credit, rows)
 
 
+def _measure_columns_from_headers(
+    ws: Worksheet, header_start: int, data_start: int
+) -> set[int]:
+    """Find columns structurally used for numeric balance/turnover measures.
+
+    Grouped ОСВ exports commonly put several numeric sections beside the
+    hierarchy column.  Their values can look exactly like account codes after
+    Excel has converted them to numbers, so the header role is useful negative
+    evidence when recovering the hierarchy column.
+    """
+
+    measure_columns: set[int] = set()
+    for row in range(header_start, data_start):
+        for column in range(1, ws.max_column + 1):
+            value = ws.cell(row, column).value
+            text = _normalize_text(value)
+            is_measure_header = (
+                _side_label(value) is not None
+                or any(marker in text for marker in _MEASURE_HEADER_MARKERS)
+            )
+            if not is_measure_header:
+                continue
+            measure_columns.add(column)
+            for merged in ws.merged_cells.ranges:
+                if (
+                    merged.min_row <= row <= merged.max_row
+                    and merged.min_col <= column <= merged.max_col
+                ):
+                    measure_columns.update(range(merged.min_col, merged.max_col + 1))
+                    break
+    return measure_columns
+
+
+def _is_numeric_like(value: Any) -> bool:
+    """Return whether a cell is a numeric measure representation."""
+
+    if value is None:
+        return True
+    try:
+        _excel_decimal(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _has_grouping_structure(
+    ws: Worksheet,
+    column: int,
+    data_start: int,
+    measure_columns: set[int],
+) -> bool:
+    """Require hierarchy semantics before accepting an account-token column."""
+
+    explicit_roles = 0
+    unlabelled_hierarchy_values = 0
+    indented_hierarchy_values = 0
+    for row in range(data_start, ws.max_row + 1):
+        cell = ws.cell(row, column)
+        value = cell.value
+        if not _display_text(value):
+            continue
+        marker = _role_marker(value)
+        if marker is not None:
+            if marker[0] in {"organization", "department", "supplier"}:
+                explicit_roles += 1
+            # ОВ/ФВ and total labels are presentation rows, not hierarchy
+            # evidence for a column that otherwise contains only amounts.
+            continue
+        if (
+            column in measure_columns
+            or _account_boundary_token(value) is not None
+            or _is_numeric_like(value)
+            or _side_label(value) is not None
+        ):
+            continue
+        unlabelled_hierarchy_values += 1
+        if (
+            _leading_indent(value) is not None
+            or (cell.alignment.indent is not None and cell.alignment.indent > 0)
+            or ws.row_dimensions[row].outlineLevel > 0
+        ):
+            indented_hierarchy_values += 1
+
+    if explicit_roles:
+        return True
+    return unlabelled_hierarchy_values >= 1 and indented_hierarchy_values > 0
+
+
 def _find_grouping_column(
     ws: Worksheet, layout: EndingBalanceColumns
 ) -> int | ParserDiagnostic:
+    data_start = layout.header_rows[-1] + 1
+    measure_columns = _measure_columns_from_headers(
+        ws, min(layout.header_rows), data_start
+    )
     candidates: set[int] = set()
-    for row in range(layout.header_rows[-1] + 1, ws.max_row + 1):
+    account_marker_columns: set[int] = set()
+    for row in range(data_start, ws.max_row + 1):
         for column in range(1, ws.max_column + 1):
             if column in {layout.debit_column, layout.credit_column}:
                 continue
             token = _account_boundary_token(ws.cell(row, column).value)
             if token is not None:
                 previous = _normalize_text(ws.cell(row, column - 1).value) if column > 1 else ""
-                if previous in {"счет", "account"}:
-                    candidates.add(column - 1)
-                else:
-                    candidates.add(column)
+                candidate = column - 1 if previous in {"счет", "account"} else column
+                # A token in a semantically numeric section is an amount, not
+                # an account boundary.  Keep an explicit account-label/value
+                # pair eligible because its label column is the hierarchy
+                # column by construction.
+                if candidate == column and column in measure_columns:
+                    continue
+                account_marker_columns.add(candidate)
+
+    for candidate in account_marker_columns:
+        if _has_grouping_structure(ws, candidate, data_start, measure_columns):
+            candidates.add(candidate)
     if not candidates:
         return ParserDiagnostic(
             ParserDiagnosticCode.MISSING_ACCOUNT_CONTEXT,
-            "no exact account boundary was found in the grouped column",
+            "no structurally supported account boundary was found in the grouped column",
             ws.title,
         )
     if len(candidates) > 1:
