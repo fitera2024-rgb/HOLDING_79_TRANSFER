@@ -135,6 +135,76 @@ def test_same_normalized_input_is_byte_stable_for_financial_artifacts(tmp_path: 
     ]
 
 
+def test_zero_balance_run_publishes_auditable_empty_export(tmp_path: Path):
+    workbook = build_synthetic_osv_workbook()
+    try:
+        workbook.remove(workbook["BLOCKED_SOURCE_ROW"])
+        for worksheet in workbook.worksheets:
+            worksheet["H9"] = "0"
+            worksheet["I9"] = "0"
+        result = run_integration(workbook, tmp_path / "run", period_end="2024-12-31")
+    finally:
+        workbook.close()
+
+    assert result.is_success
+    assert result.posting_rows == ()
+    assert result.exported_workbooks == ()
+    assert all(balance.status.value == "NO_ACTION" for balance in result.normalized_balances)
+    assert (result.output_dir / "export").is_dir()
+    assert list((result.output_dir / "export").iterdir()) == []
+
+    summary = json.loads((result.output_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["counts"] == {
+        "actionable_source_rows": 0,
+        "blocked_source_rows": 0,
+        "export_rows": 0,
+        "export_workbooks": 0,
+        "no_action_source_rows": 4,
+        "normalized_balances": 4,
+        "parser_diagnostics": 0,
+        "posting_rows": 0,
+        "source_rows": 4,
+    }
+    export_manifest = json.loads(
+        (result.output_dir / "export_manifest.json").read_text(encoding="utf-8")
+    )
+    assert export_manifest["financial_row_count"] == 0
+    assert export_manifest["workbooks"] == []
+    control_workbook = load_workbook(result.output_dir / "run_control.xlsx", read_only=True)
+    try:
+        assert control_workbook.sheetnames == list(CONTROL_SHEET_NAMES)
+    finally:
+        control_workbook.close()
+
+
+def test_financial_record_id_collision_across_source_sheets_fails_closed(tmp_path: Path):
+    workbook = build_synthetic_osv_workbook()
+    duplicate = workbook.copy_worksheet(workbook["DEBIT_79_2_AT"])
+    duplicate.title = "DUPLICATE_DEBIT_79_2"
+    try:
+        with pytest.raises(IntegrationRunError, match="financial_record_id"):
+            run_integration(workbook, tmp_path / "run", period_end="2024-12-31")
+    finally:
+        workbook.close()
+    assert not (tmp_path / "run").exists()
+
+
+def test_corrupt_summary_json_is_rejected_before_publication(tmp_path: Path, monkeypatch):
+    import holding79_transfer.integration as integration_module
+
+    original_write_json = integration_module._write_json
+
+    def corrupt_summary(path: Path, value: object) -> None:
+        original_write_json(path, value)
+        if path.name == "summary.json":
+            path.write_text("{not valid json", encoding="utf-8")
+
+    monkeypatch.setattr(integration_module, "_write_json", corrupt_summary)
+    with pytest.raises(IntegrationRunError, match="summary.json"):
+        run_synthetic_integration(tmp_path / "run")
+    assert not (tmp_path / "run").exists()
+
+
 def test_on_disk_synthetic_input_uses_the_same_pipeline(tmp_path: Path):
     input_path = tmp_path / "synthetic-input.xlsx"
     workbook = build_synthetic_osv_workbook()

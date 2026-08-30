@@ -16,23 +16,31 @@ from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
+from zipfile import BadZipFile
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font
 from openpyxl.worksheet.worksheet import Worksheet
 
 from .config import TransferConfig
-from .exporter import ExportedWorkbook, export_posting_rows, validate_workbook_round_trip
+from .exporter import (
+    ExportedWorkbook,
+    XlsxExportError,
+    deterministic_filename,
+    export_posting_rows,
+    validate_workbook_round_trip,
+)
 from .models import (
     CONTRACT_VERSION,
     RULES_VERSION,
     BalanceStatus,
     NormalizedBalance,
     PostingRow,
+    financial_record_id,
 )
 from .output import OUTPUT_HEADERS, OUTPUT_SHEET_NAME, OutputAdapterConfig
 from .parser import GroupedOsvParser, ParserDiagnostic, ParseResult
@@ -59,7 +67,50 @@ CONTROL_SHEET_NAMES: tuple[str, ...] = (
 )
 
 _SAFE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+_FINANCIAL_RECORD_ID_RE = re.compile(r"FR-[0-9a-f]{64}\Z")
 _ZERO = Decimal(0)
+
+_BALANCE_ARTIFACT_KEYS: tuple[str, ...] = (
+    "period_end",
+    "organization",
+    "source_account",
+    "department",
+    "supplier_rvp",
+    "ending_debit",
+    "ending_credit",
+    "source_excel_row_ref",
+    "status",
+    "block_reason",
+)
+_POSTING_ARTIFACT_KEYS: tuple[str, ...] = (
+    "period_end",
+    "document_organization",
+    "debit_account",
+    "debit_department",
+    "debit_supplier_rvp",
+    "credit_account",
+    "credit_department",
+    "credit_supplier_rvp",
+    "amount",
+    "source_organization",
+    "source_account",
+    "source_department",
+    "source_supplier_rvp",
+    "source_excel_row_ref",
+    "financial_record_id",
+    "side",
+    "rules_version",
+)
+_DIAGNOSTIC_ARTIFACT_KEYS: tuple[str, ...] = (
+    "sheet_name",
+    "excel_row",
+    "excel_column",
+    "source_excel_row_ref",
+    "code",
+    "reason",
+    "message",
+    "status",
+)
 
 
 class IntegrationRunError(RuntimeError):
@@ -455,6 +506,24 @@ def _financial_controls(
         )
 
     actual_rows = tuple(batch.rows)
+    financial_id_refs: dict[str, set[str]] = defaultdict(set)
+    for row in actual_rows:
+        financial_id_refs[row.financial_record_id].add(row.source_excel_row_ref or "")
+    colliding_ids = sorted(
+        financial_id
+        for financial_id, source_refs in financial_id_refs.items()
+        if len(source_refs) > 1
+    )
+    if colliding_ids:
+        collisions = ", ".join(
+            f"{financial_id}: {sorted(financial_id_refs[financial_id])}"
+            for financial_id in colliding_ids
+        )
+        raise _control_failure(
+            "financial_record_id maps to multiple source_excel_row_ref values: "
+            + collisions
+        )
+
     expected_counts = Counter(_posting_identity(row) for row in expected_rows)
     actual_counts = Counter(_posting_identity(row) for row in actual_rows)
     if actual_counts != expected_counts:
@@ -491,6 +560,11 @@ def _financial_controls(
         raise _control_failure("blocked parser/source row has financial output")
 
     checks = [
+        {
+            "control": "financial_record_id_one_source_ref",
+            "status": "PASS",
+            "value": len(financial_id_refs),
+        },
         {"control": "source_row_reconciliation", "status": "PASS", "value": len(expected_rows)},
         {
             "control": "source_effect_zero",
@@ -825,40 +899,927 @@ def _export_manifest(
         )
     export_records.sort(key=lambda record: record["path"])
     export_row_count = sum(record["financial_row_count"] for record in export_records)
-    if not export_records or export_row_count != len(rows):
+    if export_row_count != len(rows):
         raise _control_failure("export manifest does not cover every financial PostingRow")
     return export_records, export_row_count
 
 
+def _artifact_failure(name: str, message: str) -> None:
+    raise IntegrationRunError(f"artifact validation failed: {name}: {message}")
+
+
+def _read_json_artifact(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        _artifact_failure(path.name, f"invalid JSON: {exc}")
+    if not isinstance(value, dict):
+        _artifact_failure(path.name, "top-level value must be an object")
+    return value
+
+
+def _read_jsonl_artifact(path: Path) -> list[dict[str, Any]]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        _artifact_failure(path.name, f"cannot read JSONL: {exc}")
+    records: list[dict[str, Any]] = []
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            _artifact_failure(path.name, f"blank JSONL line {line_number}")
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as exc:
+            _artifact_failure(path.name, f"invalid JSON on line {line_number}: {exc}")
+        if not isinstance(value, dict):
+            _artifact_failure(path.name, f"line {line_number} must be an object")
+        records.append(value)
+    return records
+
+
+def _require_artifact_keys(
+    record: Mapping[str, Any], expected: tuple[str, ...], label: str
+) -> None:
+    if set(record) != set(expected):
+        _artifact_failure(
+            label,
+            f"schema keys differ: expected {list(expected)!r}, got {sorted(record)!r}",
+        )
+
+
+def _artifact_text(
+    record: Mapping[str, Any], key: str, label: str, *, allow_empty: bool = False
+) -> str:
+    value = record.get(key)
+    if not isinstance(value, str) or (not allow_empty and not value):
+        _artifact_failure(label, f"{key} must be a {'non-empty ' if not allow_empty else ''}string")
+    return value
+
+
+def _artifact_bool(record: Mapping[str, Any], key: str, label: str) -> bool:
+    value = record.get(key)
+    if not isinstance(value, bool):
+        _artifact_failure(label, f"{key} must be a boolean")
+    return value
+
+
+def _artifact_int(record: Mapping[str, Any], key: str, label: str) -> int:
+    value = record.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        _artifact_failure(label, f"{key} must be an integer")
+    return value
+
+
+def _artifact_date(value: Any, label: str, *, allow_none: bool = False) -> date | None:
+    if value is None and allow_none:
+        return None
+    if not isinstance(value, str) or not value:
+        _artifact_failure(label, "date must be an ISO string")
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        _artifact_failure(label, f"invalid ISO date: {value!r}: {exc}")
+
+
+def _artifact_decimal(value: Any, label: str) -> Decimal:
+    if not isinstance(value, str):
+        _artifact_failure(label, "monetary value must be a string")
+    try:
+        result = Decimal(value)
+    except InvalidOperation as exc:
+        _artifact_failure(label, f"invalid Decimal value: {value!r}: {exc}")
+    if not result.is_finite() or _decimal_text(result) != value:
+        _artifact_failure(label, f"non-canonical or non-finite Decimal value: {value!r}")
+    return result
+
+
+def _control_rows(
+    workbook: Any,
+    name: str,
+    headers: tuple[str, ...],
+    label: str,
+) -> list[tuple[Any, ...]]:
+    if name not in workbook.sheetnames:
+        _artifact_failure(label, f"missing control sheet {name!r}")
+    worksheet = workbook[name]
+    actual_headers = tuple(
+        worksheet.cell(row=1, column=column).value
+        for column in range(1, worksheet.max_column + 1)
+    )
+    if actual_headers != headers:
+        _artifact_failure(
+            label,
+            f"{name} headers differ: expected {headers!r}, got {actual_headers!r}",
+        )
+    if worksheet.max_column != len(headers):
+        _artifact_failure(label, f"{name} has wrong column count")
+    if worksheet.max_row < 2:
+        return []
+    return [
+        tuple(
+            "" if value is None else value
+            for value in row
+        )
+        for row in worksheet.iter_rows(
+            min_row=2,
+            max_row=worksheet.max_row,
+            min_col=1,
+            max_col=len(headers),
+            values_only=True,
+        )
+    ]
+
+
+def _posting_model_from_record(record: Mapping[str, Any], label: str) -> PostingRow:
+    try:
+        row = PostingRow.model_validate(record)
+    except (TypeError, ValueError) as exc:  # pragma: no cover - pydantic message varies
+        _artifact_failure(label, f"invalid PostingRow schema: {exc}")
+    if row.status is not BalanceStatus.ACTIONABLE:
+        _artifact_failure(label, "PostingRow is not actionable")
+    if not _FINANCIAL_RECORD_ID_RE.fullmatch(row.financial_record_id):
+        _artifact_failure(label, "financial_record_id is not a canonical deterministic id")
+    return row
+
+
 def _validate_artifacts(root: Path) -> None:
+    """Validate the complete staged artifact graph before publication.
+
+    The JSON/JSONL files are the machine-readable audit trail.  The control
+    workbook and export workbooks are checked against that trail so a staged
+    artifact cannot be edited into a superficially successful run.
+    """
+
     for name in RUN_ARTIFACT_NAMES:
         path = root / name
         if not path.is_file():
             raise IntegrationRunError(f"mandatory artifact is missing: {name}")
-    export_paths = sorted((root / "export").glob("*.xlsx"))
-    if not export_paths:
-        raise IntegrationRunError("mandatory artifact is missing: export/*.xlsx")
+    export_root = root / "export"
+    if not export_root.is_dir():
+        raise IntegrationRunError("mandatory artifact is missing: export/")
 
-    workbook = load_workbook(root / "run_control.xlsx", read_only=True, data_only=False)
-    try:
-        missing = [name for name in CONTROL_SHEET_NAMES if name not in workbook.sheetnames]
-        if missing:
-            raise IntegrationRunError(
-                "mandatory control sheets are missing: " + ", ".join(missing)
-            )
-    finally:
-        workbook.close()
+    input_manifest = _read_json_artifact(root / "input_manifest.json")
+    _require_artifact_keys(
+        input_manifest,
+        (
+            "artifact_version",
+            "run_id",
+            "contract_version",
+            "input_name",
+            "normalized_input_sha256",
+            "period_end",
+            "source_sheets",
+            "parser_diagnostics",
+            "config",
+        ),
+        "input_manifest.json",
+    )
+    artifact_version = _artifact_text(input_manifest, "artifact_version", "input_manifest.json")
+    run_id = _artifact_text(input_manifest, "run_id", "input_manifest.json")
+    contract_version = _artifact_text(input_manifest, "contract_version", "input_manifest.json")
+    input_name = _artifact_text(input_manifest, "input_name", "input_manifest.json")
+    fingerprint = _artifact_text(
+        input_manifest, "normalized_input_sha256", "input_manifest.json"
+    )
+    if artifact_version != "H79_TRANSFER_RUN_V1":
+        _artifact_failure("input_manifest.json", "unsupported artifact_version")
+    if not _SAFE_ID_RE.fullmatch(run_id):
+        _artifact_failure("input_manifest.json", "run_id is not safe and deterministic")
+    if contract_version != CONTRACT_VERSION:
+        _artifact_failure("input_manifest.json", "contract_version is not approved")
+    if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+        _artifact_failure("input_manifest.json", "normalized_input_sha256 is not a SHA-256")
 
-    for path in export_paths:
-        workbook = load_workbook(path, read_only=True, data_only=False)
+    source_sheets = input_manifest["source_sheets"]
+    if not isinstance(source_sheets, list) or not source_sheets:
+        _artifact_failure("input_manifest.json", "source_sheets must be a non-empty list")
+    sheet_names: list[str] = []
+    for index, sheet_record in enumerate(source_sheets):
+        label = f"input_manifest.json source_sheets[{index}]"
+        if not isinstance(sheet_record, dict):
+            _artifact_failure(label, "sheet record must be an object")
+        _require_artifact_keys(
+            sheet_record,
+            ("sheet_name", "status", "normalized_balance_count", "diagnostic_count"),
+            label,
+        )
+        sheet_name = _artifact_text(sheet_record, "sheet_name", label)
+        if sheet_name in sheet_names:
+            _artifact_failure(label, f"duplicate sheet_name: {sheet_name}")
+        sheet_names.append(sheet_name)
+        status = _artifact_text(sheet_record, "status", label)
+        if status not in {
+            BalanceStatus.ACTIONABLE.value,
+            BalanceStatus.NO_ACTION.value,
+            BalanceStatus.BLOCKED.value,
+        }:
+            _artifact_failure(label, f"unsupported sheet status: {status}")
+        if _artifact_int(sheet_record, "normalized_balance_count", label) < 0:
+            _artifact_failure(label, "normalized_balance_count must not be negative")
+        if _artifact_int(sheet_record, "diagnostic_count", label) < 0:
+            _artifact_failure(label, "diagnostic_count must not be negative")
+
+    config_record = input_manifest["config"]
+    if not isinstance(config_record, dict):
+        _artifact_failure("input_manifest.json", "config must be an object")
+    _require_artifact_keys(
+        config_record,
+        ("period_end", "transfer", "adapter", "input_name", "sheet_names"),
+        "input_manifest.json config",
+    )
+    if config_record["input_name"] != input_name:
+        _artifact_failure("input_manifest.json", "config input_name does not match manifest")
+    transfer_config = config_record["transfer"]
+    adapter_config = config_record["adapter"]
+    if not isinstance(transfer_config, dict) or not isinstance(adapter_config, dict):
+        _artifact_failure("input_manifest.json config", "transfer and adapter must be objects")
+    _require_artifact_keys(
+        transfer_config,
+        ("manager_organization", "manager_financial_department", "rules_version"),
+        "input_manifest.json config.transfer",
+    )
+    _require_artifact_keys(
+        adapter_config,
+        (
+            "operation_type",
+            "currency",
+            "debit_activity",
+            "credit_activity",
+            "contract_version",
+            "rules_version",
+        ),
+        "input_manifest.json config.adapter",
+    )
+    for key in ("manager_organization", "manager_financial_department", "rules_version"):
+        _artifact_text(transfer_config, key, "input_manifest.json config.transfer")
+    for key in (
+        "operation_type",
+        "currency",
+        "debit_activity",
+        "credit_activity",
+        "contract_version",
+        "rules_version",
+    ):
+        _artifact_text(adapter_config, key, "input_manifest.json config.adapter", allow_empty=key in {
+            "currency",
+            "debit_activity",
+            "credit_activity",
+        })
+    if transfer_config["rules_version"] != RULES_VERSION:
+        _artifact_failure("input_manifest.json", "transfer rules_version is not approved")
+    if (
+        adapter_config["rules_version"] != transfer_config["rules_version"]
+        or adapter_config["contract_version"] != contract_version
+    ):
+        _artifact_failure("input_manifest.json", "transfer/output versions do not reconcile")
+    configured_sheet_names = config_record["sheet_names"]
+    if configured_sheet_names is not None and (
+        not isinstance(configured_sheet_names, list)
+        or configured_sheet_names != sheet_names
+    ):
+        _artifact_failure("input_manifest.json", "configured sheet_names do not reconcile")
+
+    normalized_records = _read_jsonl_artifact(root / "normalized_balances.jsonl")
+    balances: list[NormalizedBalance] = []
+    balances_by_ref: dict[str, NormalizedBalance] = {}
+    for index, record in enumerate(normalized_records):
+        label = f"normalized_balances.jsonl line {index + 1}"
+        _require_artifact_keys(record, _BALANCE_ARTIFACT_KEYS, label)
+        period_end = _artifact_date(record["period_end"], label)
+        organization = _artifact_text(record, "organization", label)
+        source_account = _artifact_text(record, "source_account", label)
+        if source_account not in {"79.2", "79.3"}:
+            _artifact_failure(label, f"unsupported source_account: {source_account}")
+        department = _artifact_text(record, "department", label)
+        supplier = _artifact_text(record, "supplier_rvp", label)
+        source_ref = _artifact_text(record, "source_excel_row_ref", label)
+        status = _artifact_text(record, "status", label)
+        if status not in {BalanceStatus.ACTIONABLE.value, BalanceStatus.NO_ACTION.value}:
+            _artifact_failure(label, f"unsupported balance status: {status}")
+        if record["block_reason"] is not None:
+            _artifact_failure(label, "successful normalized balance cannot have block_reason")
+        ending_debit = _artifact_decimal(record["ending_debit"], label)
+        ending_credit = _artifact_decimal(record["ending_credit"], label)
+        if status == BalanceStatus.NO_ACTION.value and (ending_debit or ending_credit):
+            _artifact_failure(label, "NO_ACTION balance has a non-zero ending side")
+        if status == BalanceStatus.ACTIONABLE.value and (
+            (ending_debit == _ZERO) == (ending_credit == _ZERO)
+        ):
+            _artifact_failure(label, "ACTIONABLE balance does not have exactly one ending side")
+        if source_ref in balances_by_ref:
+            _artifact_failure(label, f"duplicate source_excel_row_ref: {source_ref}")
         try:
-            if workbook.sheetnames != [OUTPUT_SHEET_NAME]:
-                raise IntegrationRunError(f"export workbook has unexpected sheets: {path.name}")
-            worksheet = workbook[OUTPUT_SHEET_NAME]
-            if worksheet.max_column != len(OUTPUT_HEADERS):
-                raise IntegrationRunError(f"export workbook has wrong column count: {path.name}")
-        finally:
-            workbook.close()
+            balance = NormalizedBalance(
+                period_end=period_end,
+                organization=organization,
+                source_account=source_account,
+                department=department,
+                supplier_rvp=supplier,
+                ending_debit=ending_debit,
+                ending_credit=ending_credit,
+                source_excel_row_ref=source_ref,
+            )
+        except (TypeError, ValueError) as exc:
+            _artifact_failure(label, f"invalid normalized balance: {exc}")
+        if balance.status.value != status:
+            _artifact_failure(label, "serialized balance status does not match its values")
+        balances.append(balance)
+        balances_by_ref[source_ref] = balance
+
+    diagnostics = input_manifest["parser_diagnostics"]
+    if not isinstance(diagnostics, list):
+        _artifact_failure("input_manifest.json", "parser_diagnostics must be a list")
+    diagnostic_records: list[dict[str, Any]] = []
+    for index, record in enumerate(diagnostics):
+        label = f"input_manifest.json parser_diagnostics[{index}]"
+        if not isinstance(record, dict):
+            _artifact_failure(label, "diagnostic must be an object")
+        _require_artifact_keys(record, _DIAGNOSTIC_ARTIFACT_KEYS, label)
+        sheet_name = _artifact_text(record, "sheet_name", label)
+        if sheet_name not in sheet_names:
+            _artifact_failure(label, f"unknown diagnostic sheet: {sheet_name}")
+        excel_row = _artifact_int(record, "excel_row", label)
+        if excel_row <= 0:
+            _artifact_failure(label, "excel_row must be positive")
+        if record["excel_column"] is not None:
+            excel_column = _artifact_int(record, "excel_column", label)
+            if excel_column <= 0:
+                _artifact_failure(label, "excel_column must be positive")
+        source_ref = _artifact_text(record, "source_excel_row_ref", label)
+        if source_ref != f"{sheet_name}!R{excel_row}":
+            _artifact_failure(label, "source_excel_row_ref does not match sheet and row")
+        _artifact_text(record, "code", label)
+        _artifact_text(record, "reason", label)
+        _artifact_text(record, "message", label)
+        if _artifact_text(record, "status", label) != BalanceStatus.BLOCKED.value:
+            _artifact_failure(label, "parser diagnostic status must be BLOCKED")
+        diagnostic_records.append(record)
+
+    source_sheet_counts = {record["sheet_name"]: record for record in source_sheets}
+    for sheet_name, record in source_sheet_counts.items():
+        sheet_balances = sum(
+            1 for balance in balances if balance.source_excel_row_ref.startswith(f"{sheet_name}!R")
+        )
+        sheet_diagnostics = sum(
+            1 for diagnostic in diagnostic_records if diagnostic["sheet_name"] == sheet_name
+        )
+        if record["normalized_balance_count"] != sheet_balances:
+            _artifact_failure("input_manifest.json", f"normalized count mismatch for {sheet_name}")
+        if record["diagnostic_count"] != sheet_diagnostics:
+            _artifact_failure("input_manifest.json", f"diagnostic count mismatch for {sheet_name}")
+        expected_status = (
+            BalanceStatus.BLOCKED.value
+            if sheet_diagnostics
+            else (
+                BalanceStatus.ACTIONABLE.value
+                if any(
+                    balance.status is BalanceStatus.ACTIONABLE
+                    and balance.source_excel_row_ref.startswith(f"{sheet_name}!R")
+                    for balance in balances
+                )
+                else BalanceStatus.NO_ACTION.value
+            )
+        )
+        if record["status"] != expected_status:
+            _artifact_failure("input_manifest.json", f"status mismatch for {sheet_name}")
+    manifest_period = _artifact_date(
+        input_manifest["period_end"], "input_manifest.json", allow_none=True
+    )
+    periods = {balance.period_end for balance in balances}
+    if len(periods) > 1 or (periods and manifest_period != next(iter(periods))):
+        _artifact_failure("input_manifest.json", "period_end does not reconcile with balances")
+    expected_fingerprint_payload = {
+        "contract_version": CONTRACT_VERSION,
+        "config": config_record,
+        "normalized_balances": normalized_records,
+        "diagnostics": diagnostic_records,
+    }
+    expected_fingerprint = hashlib.sha256(
+        _canonical_json(expected_fingerprint_payload).encode("utf-8")
+    ).hexdigest()
+    if fingerprint != expected_fingerprint:
+        _artifact_failure("input_manifest.json", "normalized input fingerprint does not reconcile")
+
+    posting_records = _read_jsonl_artifact(root / "posting_rows.jsonl")
+    posting_rows: list[PostingRow] = []
+    blocked_source_refs = {record["source_excel_row_ref"] for record in diagnostic_records}
+    financial_id_refs: dict[str, set[str]] = defaultdict(set)
+    rows_by_ref: dict[str, list[PostingRow]] = defaultdict(list)
+    for index, record in enumerate(posting_records):
+        label = f"posting_rows.jsonl line {index + 1}"
+        _require_artifact_keys(record, _POSTING_ARTIFACT_KEYS, label)
+        row = _posting_model_from_record(record, label)
+        source_ref = row.source_excel_row_ref or ""
+        balance = balances_by_ref.get(source_ref)
+        if balance is None:
+            _artifact_failure(label, f"unknown source_excel_row_ref: {source_ref}")
+        if source_ref in blocked_source_refs:
+            _artifact_failure(label, "financial row references a blocked source reference")
+        if balance.status is not BalanceStatus.ACTIONABLE:
+            _artifact_failure(label, "financial row references a non-actionable balance")
+        if row.rules_version != transfer_config["rules_version"]:
+            _artifact_failure(label, "financial row rules_version does not match configuration")
+        if row.financial_record_id != financial_record_id(
+            balance, transfer_config["rules_version"]
+        ):
+            _artifact_failure(label, "financial_record_id does not match normalized business identity")
+        if row.amount != balance.amount or row.side is not balance.ending_side:
+            _artifact_failure(label, "financial row amount or side does not match balance")
+        if any(
+            (
+                row.period_end != balance.period_end,
+                row.source_organization != balance.organization,
+                (
+                    row.source_account.value if row.source_account else None
+                )
+                != (
+                    balance.source_account.value if balance.source_account else None
+                ),
+                row.source_department != balance.department,
+                row.source_supplier_rvp != balance.supplier_rvp,
+            )
+        ):
+            _artifact_failure(label, "financial row source trace does not match balance")
+        financial_id_refs[row.financial_record_id].add(source_ref)
+        rows_by_ref[source_ref].append(row)
+        posting_rows.append(row)
+    for financial_id, source_refs in financial_id_refs.items():
+        if len(source_refs) != 1:
+            _artifact_failure(
+                "posting_rows.jsonl",
+                f"financial_record_id maps to multiple source references: {financial_id}",
+            )
+    for source_ref, rows in rows_by_ref.items():
+        if len(rows) != 2:
+            _artifact_failure(
+                "posting_rows.jsonl",
+                f"source reference does not have exactly two PostingRows: {source_ref}",
+            )
+
+    export_manifest = _read_json_artifact(root / "export_manifest.json")
+    _require_artifact_keys(
+        export_manifest,
+        (
+            "run_id",
+            "contract_version",
+            "sheet_name",
+            "headers",
+            "financial_row_count",
+            "round_trip_validated",
+            "workbooks",
+        ),
+        "export_manifest.json",
+    )
+    if export_manifest["run_id"] != run_id:
+        _artifact_failure("export_manifest.json", "run_id does not match input_manifest")
+    if export_manifest["contract_version"] != contract_version:
+        _artifact_failure("export_manifest.json", "contract_version does not match input_manifest")
+    if export_manifest["sheet_name"] != OUTPUT_SHEET_NAME:
+        _artifact_failure("export_manifest.json", "unexpected output sheet name")
+    if export_manifest["headers"] != list(OUTPUT_HEADERS):
+        _artifact_failure("export_manifest.json", "output headers do not match the 27-column contract")
+    if not _artifact_bool(export_manifest, "round_trip_validated", "export_manifest.json"):
+        _artifact_failure("export_manifest.json", "round_trip_validated must be true")
+    if _artifact_int(export_manifest, "financial_row_count", "export_manifest.json") != len(
+        posting_rows
+    ):
+        _artifact_failure("export_manifest.json", "financial_row_count does not match PostingRows")
+    workbooks = export_manifest["workbooks"]
+    if not isinstance(workbooks, list):
+        _artifact_failure("export_manifest.json", "workbooks must be a list")
+    try:
+        output_adapter = OutputAdapterConfig(
+            operation_type=adapter_config["operation_type"],
+            currency=adapter_config["currency"],
+            debit_activity=adapter_config["debit_activity"],
+            credit_activity=adapter_config["credit_activity"],
+            run_id=run_id,
+            contract_version=adapter_config["contract_version"],
+            rules_version=adapter_config["rules_version"],
+        )
+    except (TypeError, ValueError) as exc:
+        _artifact_failure("input_manifest.json config.adapter", f"invalid adapter config: {exc}")
+
+    manifest_export_paths: list[str] = []
+    for index, record in enumerate(workbooks):
+        label = f"export_manifest.json workbooks[{index}]"
+        if not isinstance(record, dict):
+            _artifact_failure(label, "workbook record must be an object")
+        _require_artifact_keys(
+            record,
+            (
+                "path",
+                "document_organization",
+                "document_date",
+                "sheet_name",
+                "column_count",
+                "financial_row_count",
+                "round_trip",
+                "status",
+            ),
+            label,
+        )
+        relative_path = _artifact_text(record, "path", label)
+        pure_path = PurePosixPath(relative_path)
+        if (
+            pure_path.parts[:1] != ("export",)
+            or len(pure_path.parts) != 2
+            or pure_path.suffix.casefold() != ".xlsx"
+        ):
+            _artifact_failure(label, f"unsafe export path: {relative_path}")
+        document_organization = _artifact_text(record, "document_organization", label)
+        document_date = _artifact_date(record["document_date"], label)
+        if record["sheet_name"] != OUTPUT_SHEET_NAME:
+            _artifact_failure(label, "unexpected workbook sheet name")
+        if _artifact_int(record, "column_count", label) != len(OUTPUT_HEADERS):
+            _artifact_failure(label, "workbook column count is not 27")
+        row_count = _artifact_int(record, "financial_row_count", label)
+        if row_count <= 0:
+            _artifact_failure(label, "published workbook must contain financial rows")
+        if not _artifact_bool(record, "round_trip", label):
+            _artifact_failure(label, "workbook round_trip must be true")
+        if _artifact_text(record, "status", label) != "PASS":
+            _artifact_failure(label, "workbook status must be PASS")
+        expected_path = f"export/{deterministic_filename(document_date, document_organization)}"
+        if relative_path != expected_path:
+            _artifact_failure(label, "workbook path is not deterministic for its group")
+        if relative_path in manifest_export_paths:
+            _artifact_failure(label, f"duplicate workbook path: {relative_path}")
+        manifest_export_paths.append(relative_path)
+        group_rows = tuple(
+            row
+            for row in posting_rows
+            if row.period_end == document_date
+            and row.document_organization == document_organization
+        )
+        if row_count != len(group_rows):
+            _artifact_failure(label, "workbook row count does not match PostingRows group")
+        workbook_path = root / Path(*pure_path.parts)
+        if not workbook_path.is_file():
+            _artifact_failure(label, f"workbook file is missing: {relative_path}")
+        try:
+            validate_workbook_round_trip(workbook_path, group_rows, output_adapter)
+        except (OSError, TypeError, ValueError, KeyError, XlsxExportError) as exc:
+            # Exporter and workbook errors are all fail-closed validation failures.
+            _artifact_failure(label, f"workbook round-trip validation failed: {exc}")
+
+    actual_export_entries = list(export_root.iterdir())
+    if any(entry.is_dir() for entry in actual_export_entries):
+        _artifact_failure("export/", "nested directories are not allowed")
+    actual_export_paths = sorted(
+        entry.relative_to(root).as_posix()
+        for entry in actual_export_entries
+        if entry.is_file()
+    )
+    if actual_export_paths != sorted(manifest_export_paths):
+        _artifact_failure(
+            "export_manifest.json",
+            f"export files do not match manifest: files={actual_export_paths!r}, "
+            f"manifest={sorted(manifest_export_paths)!r}",
+        )
+    if not posting_rows and (workbooks or actual_export_paths):
+        _artifact_failure("export_manifest.json", "zero financial rows must have an empty export directory")
+    if posting_rows and not workbooks:
+        _artifact_failure("export_manifest.json", "financial rows require published workbooks")
+
+    summary = _read_json_artifact(root / "summary.json")
+    _require_artifact_keys(
+        summary,
+        (
+            "status",
+            "run_id",
+            "contract_version",
+            "rules_version",
+            "counts",
+            "totals",
+            "controls",
+            "artifacts",
+        ),
+        "summary.json",
+    )
+    if summary["status"] != "SUCCESS":
+        _artifact_failure("summary.json", "status must be SUCCESS before publication")
+    if summary["run_id"] != run_id or summary["contract_version"] != contract_version:
+        _artifact_failure("summary.json", "run identity does not match input_manifest")
+    if summary["rules_version"] != transfer_config["rules_version"]:
+        _artifact_failure("summary.json", "rules_version does not match configuration")
+    blocked_refs = blocked_source_refs
+    actionable_count = sum(balance.status is BalanceStatus.ACTIONABLE for balance in balances)
+    no_action_count = sum(balance.status is BalanceStatus.NO_ACTION for balance in balances)
+    expected_total = sum(
+        (balance.amount for balance in balances if balance.status is BalanceStatus.ACTIONABLE),
+        _ZERO,
+    )
+    expected_counts = {
+        "actionable_source_rows": actionable_count,
+        "blocked_source_rows": len(blocked_refs),
+        "export_rows": len(posting_rows),
+        "export_workbooks": len(workbooks),
+        "no_action_source_rows": no_action_count,
+        "normalized_balances": len(balances),
+        "parser_diagnostics": len(diagnostic_records),
+        "posting_rows": len(posting_rows),
+        "source_rows": len(balances) + len(blocked_refs),
+    }
+    counts = summary["counts"]
+    if counts != expected_counts:
+        _artifact_failure("summary.json", f"counts do not reconcile: expected {expected_counts!r}")
+    totals = summary["totals"]
+    if not isinstance(totals, dict) or set(totals) != {"source_org", "gk", "difference"}:
+        _artifact_failure("summary.json", "totals schema is invalid")
+    expected_total_text = _decimal_text(expected_total)
+    if totals != {
+        "source_org": expected_total_text,
+        "gk": expected_total_text,
+        "difference": "0",
+    }:
+        _artifact_failure("summary.json", "totals do not reconcile with normalized balances")
+    controls = summary["controls"]
+    if not isinstance(controls, dict) or set(controls) != {"all_passed", "records"}:
+        _artifact_failure("summary.json", "controls schema is invalid")
+    if controls["all_passed"] is not True or not isinstance(controls["records"], list):
+        _artifact_failure("summary.json", "controls do not report an explicit all-pass result")
+    expected_checks = [
+        {
+            "control": "financial_record_id_one_source_ref",
+            "status": "PASS",
+            "value": len(financial_id_refs),
+        },
+        {"control": "source_row_reconciliation", "status": "PASS", "value": len(posting_rows)},
+        {
+            "control": "source_effect_zero",
+            "status": "PASS",
+            "value": actionable_count,
+        },
+        {
+            "control": "source_org_gk_totals_match",
+            "status": "PASS",
+            "value": expected_total_text,
+        },
+        {
+            "control": "blocked_rows_no_financial_output",
+            "status": "PASS",
+            "value": len(blocked_refs),
+        },
+        {"control": "export_round_trip", "status": "PASS", "value": len(posting_rows)},
+    ]
+    if controls["records"] != expected_checks:
+        _artifact_failure("summary.json", "control results do not reconcile")
+    expected_artifacts = list(RUN_ARTIFACT_NAMES) + sorted(manifest_export_paths)
+    if summary["artifacts"] != expected_artifacts:
+        _artifact_failure("summary.json", "artifact list does not match staged files")
+
+    control_path = root / "run_control.xlsx"
+    try:
+        control_workbook = load_workbook(control_path, read_only=True, data_only=False)
+    except (OSError, ValueError, KeyError, BadZipFile) as exc:  # openpyxl-specific corruption
+        _artifact_failure("run_control.xlsx", f"cannot reopen control workbook: {exc}")
+    try:
+        if control_workbook.sheetnames != list(CONTROL_SHEET_NAMES):
+            _artifact_failure("run_control.xlsx", "control sheet names do not match the contract")
+
+        summary_headers = ("Контроль", "Статус", "Значение", "Ожидание")
+        parameter_headers = ("Параметр", "Значение")
+        balance_headers = (
+            "source_excel_row_ref",
+            "period_end",
+            "organization",
+            "source_account",
+            "department",
+            "supplier_rvp",
+            "ending_debit",
+            "ending_credit",
+            "status",
+            "block_reason",
+        )
+        posting_headers = _POSTING_ARTIFACT_KEYS
+        blocked_headers = (
+            "source_excel_row_ref",
+            "sheet_name",
+            "excel_row",
+            "stage",
+            "code",
+            "reason",
+            "message",
+            "financial_posting_count",
+            "financial_export_count",
+            "status",
+        )
+        effect_headers = (
+            "source_excel_row_ref",
+            "period_end",
+            "organization",
+            "source_account",
+            "department",
+            "supplier_rvp",
+            "ending_debit_before",
+            "ending_credit_before",
+            "ending_debit_after",
+            "ending_credit_after",
+            "source_posting_count",
+            "source_amount",
+            "gk_amount",
+            "source_effect_zero",
+            "amounts_match",
+            "direction_correct",
+            "source_consumed_once",
+            "status",
+        )
+        source_headers = (
+            "source_excel_row_ref",
+            "stage",
+            "status",
+            "organization",
+            "source_account",
+            "department",
+            "supplier_rvp",
+            "block_code",
+            "message",
+        )
+        export_headers = (
+            "path",
+            "document_organization",
+            "document_date",
+            "sheet_name",
+            "column_count",
+            "financial_row_count",
+            "round_trip",
+            "status",
+        )
+
+        actual_summary_rows = _control_rows(
+            control_workbook, "Итоги", summary_headers, "run_control.xlsx"
+        )
+        expected_summary_rows = [
+            ("run_id", "PASS", run_id, "non-empty deterministic run id"),
+            ("contract_version", "PASS", contract_version, CONTRACT_VERSION),
+            ("rules_version", "PASS", transfer_config["rules_version"], RULES_VERSION),
+            ("source_rows", "PASS", expected_counts["source_rows"], "source rows retained"),
+            ("posting_rows", "PASS", len(posting_rows), "two per actionable source row"),
+            ("source_org_total", "PASS", expected_total_text, "Decimal total"),
+            ("gk_total", "PASS", expected_total_text, "Decimal total"),
+            ("blocked_source_rows", "PASS", len(blocked_refs), "retained in diagnostics"),
+            ("export_round_trip", "PASS", len(workbooks), "all produced workbooks reopened"),
+        ] + [
+            (check["control"], check["status"], check["value"], "PASS")
+            for check in expected_checks
+        ]
+        if actual_summary_rows != expected_summary_rows:
+            _artifact_failure("run_control.xlsx", "Итоги does not match summary/control results")
+
+        actual_parameters = _control_rows(
+            control_workbook, "Параметры_запуска", parameter_headers, "run_control.xlsx"
+        )
+        expected_parameters = [
+            ("run_id", run_id),
+            ("contract_version", contract_version),
+            (
+                "period_end",
+                config_record["period_end"] if config_record["period_end"] is not None else "discovered",
+            ),
+            ("manager_organization", transfer_config["manager_organization"]),
+            ("manager_financial_department", transfer_config["manager_financial_department"]),
+            ("rules_version", transfer_config["rules_version"]),
+            ("operation_type", adapter_config["operation_type"]),
+            ("currency", adapter_config["currency"]),
+            ("debit_activity", adapter_config["debit_activity"]),
+            ("credit_activity", adapter_config["credit_activity"]),
+            ("input_name", input_name),
+        ]
+        if actual_parameters != expected_parameters:
+            _artifact_failure("run_control.xlsx", "Параметры_запуска does not match input_manifest")
+
+        actual_balances = _control_rows(
+            control_workbook, "Остатки_79", balance_headers, "run_control.xlsx"
+        )
+        expected_balances = [
+            tuple(
+                record[key] if record[key] is not None else ""
+                for key in balance_headers
+            )
+            for record in sorted(normalized_records, key=lambda item: item["source_excel_row_ref"])
+        ]
+        if actual_balances != expected_balances:
+            _artifact_failure("run_control.xlsx", "Остатки_79 does not match normalized_balances.jsonl")
+
+        actual_postings = _control_rows(
+            control_workbook, "Готовые_проводки", posting_headers, "run_control.xlsx"
+        )
+        expected_postings = [
+            tuple(record[key] if record[key] is not None else "" for key in posting_headers)
+            for record in posting_records
+        ]
+        if actual_postings != expected_postings:
+            _artifact_failure("run_control.xlsx", "Готовые_проводки does not match posting_rows.jsonl")
+
+        actual_blocked = _control_rows(
+            control_workbook, "Блокировки", blocked_headers, "run_control.xlsx"
+        )
+        expected_blocked = [
+            (
+                record["source_excel_row_ref"],
+                record["sheet_name"],
+                record["excel_row"],
+                "parser",
+                record["code"],
+                record["reason"],
+                record["message"],
+                0,
+                0,
+                "BLOCKED",
+            )
+            for record in diagnostic_records
+        ]
+        if actual_blocked != expected_blocked:
+            _artifact_failure("run_control.xlsx", "Блокировки does not match parser diagnostics")
+
+        actual_effects = _control_rows(
+            control_workbook, "Контроль_до_после", effect_headers, "run_control.xlsx"
+        )
+        expected_effects: list[tuple[Any, ...]] = []
+        for balance in balances:
+            is_actionable = balance.status is BalanceStatus.ACTIONABLE
+            amount = _decimal_text(balance.amount)
+            expected_effects.append(
+                (
+                    balance.source_excel_row_ref,
+                    balance.period_end.isoformat() if balance.period_end else "",
+                    balance.organization,
+                    balance.source_account.value if balance.source_account else "",
+                    balance.department,
+                    balance.supplier_rvp,
+                    _decimal_text(balance.ending_debit),
+                    _decimal_text(balance.ending_credit),
+                    "0" if is_actionable else _decimal_text(balance.ending_debit),
+                    "0" if is_actionable else _decimal_text(balance.ending_credit),
+                    1 if is_actionable else 0,
+                    amount if is_actionable else "0",
+                    amount if is_actionable else "0",
+                    "True" if is_actionable else "NO_ACTION",
+                    "True" if is_actionable else "NO_ACTION",
+                    "True" if is_actionable else "NO_ACTION",
+                    "True" if is_actionable else "NO_ACTION",
+                    BalanceStatus.ACTIONABLE.value if is_actionable else BalanceStatus.NO_ACTION.value,
+                )
+            )
+        if actual_effects != expected_effects:
+            _artifact_failure("run_control.xlsx", "Контроль_до_после does not match financial controls")
+
+        actual_source_rows = _control_rows(
+            control_workbook, "Исходные_строки", source_headers, "run_control.xlsx"
+        )
+        expected_source_rows = [
+            (
+                record["source_excel_row_ref"],
+                "normalized",
+                record["status"],
+                record["organization"],
+                record["source_account"],
+                record["department"],
+                record["supplier_rvp"],
+                "",
+                "",
+            )
+            for record in normalized_records
+        ] + [
+            (
+                record["source_excel_row_ref"],
+                "parser",
+                BalanceStatus.BLOCKED.value,
+                "",
+                "",
+                "",
+                "",
+                record["code"],
+                record["message"],
+            )
+            for record in sorted(
+                diagnostic_records, key=lambda item: item["source_excel_row_ref"]
+            )
+        ]
+        if actual_source_rows != expected_source_rows:
+            _artifact_failure("run_control.xlsx", "Исходные_строки does not match source artifacts")
+
+        actual_export_rows = _control_rows(
+            control_workbook, "Проверка_экспорта", export_headers, "run_control.xlsx"
+        )
+        expected_export_rows = [
+            (
+                record["path"],
+                record["document_organization"],
+                record["document_date"],
+                record["sheet_name"],
+                record["column_count"],
+                record["financial_row_count"],
+                record["round_trip"],
+                record["status"],
+            )
+            for record in workbooks
+        ]
+        if actual_export_rows != expected_export_rows:
+            _artifact_failure("run_control.xlsx", "Проверка_экспорта does not match export_manifest")
+    finally:
+        control_workbook.close()
 
 
 def run_integration(
