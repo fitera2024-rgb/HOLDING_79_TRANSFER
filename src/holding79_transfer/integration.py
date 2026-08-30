@@ -38,13 +38,14 @@ from .models import (
     CONTRACT_VERSION,
     RULES_VERSION,
     BalanceStatus,
+    BlockReason,
     NormalizedBalance,
     PostingRow,
     financial_record_id,
 )
 from .output import OUTPUT_HEADERS, OUTPUT_SHEET_NAME, OutputAdapterConfig
 from .parser import GroupedOsvParser, ParserDiagnostic, ParseResult
-from .transfer import TransferBatchResult, TransferEngine, TransferResult
+from .transfer import SourceEffectControl, TransferBatchResult, TransferEngine, TransferResult
 
 RUN_ARTIFACT_NAMES: tuple[str, ...] = (
     "input_manifest.json",
@@ -369,8 +370,8 @@ def _parse_sheets(
     if any(diagnostic.excel_row is None for diagnostic in ordered_diagnostics):
         codes = ", ".join(diagnostic.code.value for diagnostic in ordered_diagnostics)
         raise IntegrationRunError(f"mandatory parser/source control failed: {codes}")
-    if not ordered_balances:
-        raise IntegrationRunError("mandatory parser/source control failed: no normalized balances")
+    if not ordered_balances and not ordered_diagnostics:
+        raise IntegrationRunError("mandatory parser/source control failed: no normalized balances or diagnostics")
     return ordered_balances, ordered_diagnostics, sheet_records
 
 
@@ -425,12 +426,122 @@ def _control_failure(message: str) -> IntegrationRunError:
     return IntegrationRunError(f"mandatory control failed: {message}")
 
 
+def _canonical_transfer_batch(
+    balances: tuple[NormalizedBalance, ...],
+    transfer_config: TransferConfig,
+) -> TransferBatchResult:
+    """Build the approved batch independently of the caller-provided batch."""
+
+    transfers: list[TransferResult] = []
+    rows: list[PostingRow] = []
+    seen_source_refs: set[str] = set()
+    blocked_message: str | None = None
+
+    for balance in balances:
+        # A new engine and a new source-effect control are required for every
+        # source balance.  The cached controls in the accepted batch are not
+        # evidence for this independent canonical result.
+        transfer = TransferEngine(transfer_config).generate(balance)
+        if transfer.is_actionable:
+            source_ref = balance.source_excel_row_ref
+            if source_ref in seen_source_refs:
+                transfer = TransferResult(
+                    status=BalanceStatus.BLOCKED,
+                    reason=BlockReason.BLOCKED_INVALID_POSTING,
+                    message=f"source row consumed more than once: {source_ref}",
+                )
+            else:
+                seen_source_refs.add(source_ref or "")
+                rows.extend(transfer.rows)
+        if transfer.status is BalanceStatus.BLOCKED and blocked_message is None:
+            blocked_message = transfer.message
+        transfers.append(transfer)
+
+    if any(transfer.status is BalanceStatus.BLOCKED for transfer in transfers):
+        return TransferBatchResult(
+            status=BalanceStatus.BLOCKED,
+            transfers=tuple(transfers),
+            reason=BlockReason.BLOCKED_INVALID_POSTING,
+            message=blocked_message or "one or more transfers are blocked",
+        )
+    if any(transfer.status is BalanceStatus.ACTIONABLE for transfer in transfers):
+        return TransferBatchResult(
+            status=BalanceStatus.ACTIONABLE,
+            rows=tuple(rows),
+            transfers=tuple(transfers),
+        )
+    return TransferBatchResult(
+        status=BalanceStatus.NO_ACTION,
+        transfers=tuple(transfers),
+    )
+
+
+def _posting_rows_match(
+    actual: Iterable[Any],
+    expected: tuple[PostingRow, ...],
+) -> bool:
+    try:
+        actual_rows = tuple(actual)
+    except TypeError:
+        return False
+    if not all(isinstance(row, PostingRow) for row in actual_rows):
+        return False
+    return tuple(_posting_identity(row) for row in actual_rows) == tuple(
+        _posting_identity(row) for row in expected
+    )
+
+
+def _transfer_matches(actual: Any, expected: TransferResult) -> bool:
+    if not isinstance(actual, TransferResult):
+        return False
+    if actual.source_effect is not None and not isinstance(
+        actual.source_effect, SourceEffectControl
+    ):
+        return False
+    try:
+        rows_match = _posting_rows_match(actual.rows, expected.rows)
+    except (AttributeError, TypeError):
+        return False
+    return (
+        actual.status is expected.status
+        and rows_match
+        and actual.source_effect == expected.source_effect
+        and actual.reason is expected.reason
+        and actual.message == expected.message
+    )
+
+
+def _batch_matches_canonical(
+    actual: Any,
+    expected: TransferBatchResult,
+) -> bool:
+    if not isinstance(actual, TransferBatchResult):
+        return False
+    if actual.status is not expected.status:
+        return False
+    if not _posting_rows_match(actual.rows, expected.rows):
+        return False
+    try:
+        actual_transfers = tuple(actual.transfers)
+    except TypeError:
+        return False
+    return len(actual_transfers) == len(expected.transfers) and all(
+        _transfer_matches(actual_transfer, expected_transfer)
+        for actual_transfer, expected_transfer in zip(
+            actual_transfers, expected.transfers, strict=True
+        )
+    ) and actual.reason is expected.reason and actual.message == expected.message
+
+
 def _financial_controls(
     balances: tuple[NormalizedBalance, ...],
     batch: TransferBatchResult,
     diagnostics: tuple[ParserDiagnostic, ...],
     transfer_config: TransferConfig,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    canonical_batch = _canonical_transfer_batch(balances, transfer_config)
+    if not _batch_matches_canonical(batch, canonical_batch):
+        raise _control_failure("transfer batch does not match independent canonical output")
     if batch.status is BalanceStatus.BLOCKED:
         raise _control_failure(batch.message or "transfer batch is blocked")
 
@@ -776,8 +887,24 @@ def _write_run_control(
         diagnostic_rows,
     )
 
-    effect_headers = tuple(control_rows[0].keys()) if control_rows else (
+    effect_headers = (
         "source_excel_row_ref",
+        "period_end",
+        "organization",
+        "source_account",
+        "department",
+        "supplier_rvp",
+        "ending_debit_before",
+        "ending_credit_before",
+        "ending_debit_after",
+        "ending_credit_after",
+        "source_posting_count",
+        "source_amount",
+        "gk_amount",
+        "source_effect_zero",
+        "amounts_match",
+        "direction_correct",
+        "source_consumed_once",
         "status",
     )
     _write_control_sheet(

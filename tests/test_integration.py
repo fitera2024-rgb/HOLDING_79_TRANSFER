@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
 
@@ -175,6 +176,101 @@ def test_zero_balance_run_publishes_auditable_empty_export(tmp_path: Path):
         assert control_workbook.sheetnames == list(CONTROL_SHEET_NAMES)
     finally:
         control_workbook.close()
+
+
+def test_all_blocked_parser_source_is_auditable_with_empty_financial_output(tmp_path: Path):
+    workbook = build_synthetic_osv_workbook()
+    for sheet_name in list(workbook.sheetnames):
+        if sheet_name != "BLOCKED_SOURCE_ROW":
+            workbook.remove(workbook[sheet_name])
+    try:
+        result = run_integration(workbook, tmp_path / "run", period_end="2024-12-31")
+    finally:
+        workbook.close()
+
+    assert result.is_success
+    assert result.normalized_balances == ()
+    assert result.posting_rows == ()
+    assert len(result.diagnostics) == 1
+    assert result.diagnostics[0].code.value == "MISSING_SUPPLIER_RVP"
+
+    assert read_jsonl(result.output_dir / "normalized_balances.jsonl") == []
+    assert read_jsonl(result.output_dir / "posting_rows.jsonl") == []
+    input_manifest = json.loads(
+        (result.output_dir / "input_manifest.json").read_text(encoding="utf-8")
+    )
+    assert input_manifest["parser_diagnostics"][0]["source_excel_row_ref"] == (
+        "BLOCKED_SOURCE_ROW!R9"
+    )
+    summary = json.loads((result.output_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["counts"] == {
+        "actionable_source_rows": 0,
+        "blocked_source_rows": 1,
+        "export_rows": 0,
+        "export_workbooks": 0,
+        "no_action_source_rows": 0,
+        "normalized_balances": 0,
+        "parser_diagnostics": 1,
+        "posting_rows": 0,
+        "source_rows": 1,
+    }
+    assert summary["totals"] == {"difference": "0", "gk": "0", "source_org": "0"}
+    export_manifest = json.loads(
+        (result.output_dir / "export_manifest.json").read_text(encoding="utf-8")
+    )
+    assert export_manifest["financial_row_count"] == 0
+    assert export_manifest["workbooks"] == []
+    assert list((result.output_dir / "export").iterdir()) == []
+
+    control_workbook = load_workbook(result.output_dir / "run_control.xlsx", read_only=True)
+    try:
+        assert control_workbook.sheetnames == list(CONTROL_SHEET_NAMES)
+        assert control_workbook["Готовые_проводки"].max_row == 1
+        assert control_workbook["Контроль_до_после"].max_row == 1
+        blocked_rows = list(control_workbook["Блокировки"].iter_rows(values_only=True))
+        assert blocked_rows[1][0] == "BLOCKED_SOURCE_ROW!R9"
+    finally:
+        control_workbook.close()
+
+
+def test_tampered_accepted_transfer_rows_fail_closed_before_publication(
+    tmp_path: Path, monkeypatch
+):
+    import holding79_transfer.integration as integration_module
+
+    original_generate_batch = integration_module.TransferEngine.generate_batch
+
+    def tamper_accepted_rows(engine, balances):
+        batch = original_generate_batch(engine, balances)
+        transfers = list(batch.transfers)
+        target_index = next(
+            index for index, transfer in enumerate(transfers) if transfer.is_actionable
+        )
+        target = transfers[target_index]
+        tampered_source_row = target.rows[0].model_copy(
+            update={"debit_supplier_rvp": "WRONG_SUPPLIER"}
+        )
+        transfers[target_index] = replace(
+            target,
+            rows=(tampered_source_row, target.rows[1]),
+        )
+        tampered_rows = tuple(
+            row
+            for transfer in transfers
+            if transfer.is_actionable
+            for row in transfer.rows
+        )
+        return replace(batch, rows=tampered_rows, transfers=tuple(transfers))
+
+    monkeypatch.setattr(
+        integration_module.TransferEngine,
+        "generate_batch",
+        tamper_accepted_rows,
+    )
+
+    with pytest.raises(IntegrationRunError, match="canonical output"):
+        run_synthetic_integration(tmp_path / "run")
+    assert not (tmp_path / "run").exists()
 
 
 def test_financial_record_id_collision_across_source_sheets_fails_closed(tmp_path: Path):
