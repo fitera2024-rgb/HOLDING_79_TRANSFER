@@ -640,6 +640,53 @@ def test_shifted_grouping_column_is_detected_from_hierarchy_structure():
     assert result.balances[0].supplier_rvp == "Synthetic Supplier"
 
 
+def test_outline_only_hierarchy_supports_grouping_column_detection():
+    workbook = make_workbook(
+        [
+            ("79.2", None, None, None),
+            ("Organization-A", None, None, None),
+            ("Department-A", None, None, None),
+            ("Supplier-A", "1.00", 0, None),
+        ]
+    )
+    worksheet = workbook.active
+    for row, outline_level in ((7, 1), (8, 2), (9, 3)):
+        worksheet.row_dimensions[row].outlineLevel = outline_level
+
+    result = parse_grouped_osv(workbook, period_end=date(2024, 12, 31))
+
+    assert result.status is BalanceStatus.ACTIONABLE
+    assert result.diagnostics == ()
+    assert len(result.balances) == 1
+    assert result.balances[0].organization == "Organization-A"
+    assert result.balances[0].department == "Department-A"
+    assert result.balances[0].supplier_rvp == "Supplier-A"
+
+
+def test_outline_hierarchy_excludes_numeric_measure_account_lookalikes():
+    workbook = make_structured_measure_workbook()
+    worksheet = workbook.active
+    worksheet["A11"] = "Organization-A"
+    worksheet["A12"] = "Department-A"
+    worksheet["A13"] = "Supplier-A"
+    for row, outline_level in ((10, 0), (11, 1), (12, 2), (13, 3)):
+        worksheet.cell(row, 1).alignment = Alignment(indent=0)
+        worksheet.row_dimensions[row].outlineLevel = outline_level
+
+    layout = _detect_ending_columns(worksheet)
+    assert not isinstance(layout, ParserDiagnostic)
+    assert _find_grouping_column(worksheet, layout) == 1
+
+    result = parse_grouped_osv(workbook, period_end=date(2024, 12, 31))
+
+    assert result.status is BalanceStatus.ACTIONABLE
+    assert len(result.balances) == 1
+    assert result.balances[0].source_account.value == "79.2"
+    assert result.balances[0].organization == "Organization-A"
+    assert result.balances[0].department == "Department-A"
+    assert result.balances[0].supplier_rvp == "Supplier-A"
+
+
 def test_numeric_measure_value_equal_to_supported_account_is_not_an_account_boundary():
     workbook = make_structured_measure_workbook()
     worksheet = workbook.active

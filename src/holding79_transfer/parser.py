@@ -570,6 +570,7 @@ def _has_grouping_structure(
         if (
             _leading_indent(value) is not None
             or (cell.alignment.indent is not None and cell.alignment.indent > 0)
+            or ws.row_dimensions[row].outlineLevel > 0
         ):
             indented_hierarchy_values += 1
 
