@@ -216,15 +216,52 @@ def test_duplicate_output_is_detected_by_round_trip_control(tmp_path: Path, monk
     assert list(tmp_path.glob("*.xlsx")) == []
 
 
-def test_filename_collision_fails_closed(tmp_path: Path):
+@pytest.mark.parametrize(
+    ("first_organization", "second_organization"),
+    (
+        ("A", "a"),
+        ("ABC", "abc"),
+        ("MixedCaseOrg", "mixedcaseorg"),
+        ("CON", "con"),
+        ("A/B", "A\\B"),
+        ("X" * 180 + "A", "X" * 180 + "B"),
+    ),
+)
+def test_filename_collision_fails_closed_for_case_and_sanitization_aliases(
+    tmp_path: Path, first_organization: str, second_organization: str
+):
     rows = (
-        make_posting_row(organization="A/B", source_ref="synthetic:slash"),
-        make_posting_row(organization="A\\B", source_ref="synthetic:backslash"),
+        make_posting_row(
+            organization=first_organization,
+            source_ref="synthetic:first-collision",
+        ),
+        make_posting_row(
+            organization=second_organization,
+            source_ref="synthetic:second-collision",
+        ),
     )
 
     with pytest.raises(FilenameCollisionError, match="filename collision"):
         export_posting_rows(rows, tmp_path)
-    assert list(tmp_path.glob("*.xlsx")) == []
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_genuinely_different_safe_filenames_do_not_collide(tmp_path: Path):
+    rows = (
+        make_posting_row(organization="ABC", source_ref="synthetic:abc"),
+        make_posting_row(organization="ABD", source_ref="synthetic:abd"),
+    )
+
+    result = export_posting_rows(rows, tmp_path)
+
+    assert {path.name for path in result.paths} == {
+        "2024-12-31__ABC.xlsx",
+        "2024-12-31__ABD.xlsx",
+    }
+
+
+def test_sanitization_collision_filename_remains_deterministic():
     assert deterministic_filename(date(2024, 12, 31), "A/B") == "2024-12-31__A_B.xlsx"
 
 

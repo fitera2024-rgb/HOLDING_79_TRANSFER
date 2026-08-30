@@ -303,13 +303,14 @@ def _check_filename_collisions(
     owners: dict[str, tuple[date, str]] = {}
     for group in sorted(groups):
         filename = deterministic_filename(*group)
-        previous = owners.get(filename)
+        collision_key = filename.casefold()
+        previous = owners.get(collision_key)
         if previous is not None and previous != group:
             raise FilenameCollisionError(
                 f"filename collision: {filename!r} represents both "
                 f"{previous!r} and {group!r}"
             )
-        owners[filename] = group
+        owners[collision_key] = group
         names[group] = filename
     return names
 
