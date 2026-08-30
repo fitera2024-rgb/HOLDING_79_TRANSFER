@@ -12,4 +12,6 @@ Dependencies keep work from starting early.
 Dependency is satisfied only when the dependency Issue is BOTH closed AND labelled `accepted`.
 This prevents a task from starting merely because someone closed an Issue without accepting its code.
 
-No agent can merge a PR. Human review is a hard gate.
+Implementation agents may never merge their own PRs. Coordinator may merge a Coordinator-generated PR only after an independent ReviewerRunner PASS on the exact current HEAD and all configured GitHub status/review/protection gates. Protection bypass and admin override are prohibited.
+
+This governance is owner-approved, but autonomous mode remains disabled until an operator explicitly enables it after the required gates are verified.

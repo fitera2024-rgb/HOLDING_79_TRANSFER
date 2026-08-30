@@ -1,4 +1,4 @@
-# Product contract v0.2 — месячный перенос 79.x
+# Product contract v0.3 — месячный перенос 79.x
 
 ## 1. Назначение
 
@@ -196,4 +196,4 @@
 - errors in mandatory source identity are BLOCKED, not guessed;
 - real XLSX/MXL never committed;
 - no live 1C writes;
-- no agent/robot may merge its own PR.
+- Implementation agents may never merge their own PRs. Coordinator may merge a Coordinator-generated PR only after an independent ReviewerRunner PASS on the exact current HEAD and all configured GitHub status/review/protection gates. Protection bypass and admin override are prohibited.
