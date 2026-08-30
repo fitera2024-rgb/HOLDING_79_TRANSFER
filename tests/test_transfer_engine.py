@@ -111,6 +111,72 @@ def test_source_effect_control_proves_zero_balance_and_single_consumption(
     assert control.direction_correct
 
 
+@pytest.mark.parametrize(
+    ("source_account", "side"),
+    [
+        (SourceAccount.ACCOUNT_79_2, BalanceSide.DEBIT),
+        (SourceAccount.ACCOUNT_79_2, BalanceSide.CREDIT),
+        (SourceAccount.ACCOUNT_79_3, BalanceSide.DEBIT),
+        (SourceAccount.ACCOUNT_79_3, BalanceSide.CREDIT),
+    ],
+)
+def test_manager_organization_is_valid_source_for_both_accounts_and_sides(
+    source_account: SourceAccount, side: BalanceSide
+):
+    amount = Decimal("1234.567")
+    balance = NormalizedBalance(
+        period_end=date(2024, 12, 31),
+        source_excel_row_ref=f"synthetic:gk-source:{source_account.value}:{side.value}",
+        organization=MANAGER_ORGANIZATION,
+        source_account=source_account,
+        department="Б_ГК Коммерческий отдел",
+        supplier_rvp="Производитель",
+        ending_debit=amount if side is BalanceSide.DEBIT else Decimal(0),
+        ending_credit=amount if side is BalanceSide.CREDIT else Decimal(0),
+    )
+
+    result = generate_transfer(balance)
+
+    assert balance.status is BalanceStatus.ACTIONABLE
+    assert result.status is BalanceStatus.ACTIONABLE
+    assert len(result.rows) == 2
+    assert result.source_effect is not None
+    assert result.source_effect.passed
+    assert result.source_effect.ending_debit_after == Decimal(0)
+    assert result.source_effect.ending_credit_after == Decimal(0)
+    assert result.source_effect.source_balance_after == Decimal(0)
+    assert result.source_effect.source_posting_count == 1
+    assert result.source_effect.source_consumed_once
+    assert result.source_effect.amounts_match
+    assert result.source_effect.direction_correct
+
+    source_row, gk_row = result.rows
+    assert source_row.document_organization == MANAGER_ORGANIZATION
+    assert gk_row.document_organization == MANAGER_ORGANIZATION
+    assert source_row.amount == gk_row.amount == amount
+    assert isinstance(source_row.amount, Decimal)
+    assert isinstance(gk_row.amount, Decimal)
+    assert gk_row.debit_account.value == "79.1"
+    assert gk_row.credit_account.value == "79.1"
+    assert gk_row.debit_department == MANAGER_FINANCIAL_DEPARTMENT
+    assert gk_row.credit_department == MANAGER_FINANCIAL_DEPARTMENT
+
+    if side is BalanceSide.DEBIT:
+        assert source_row.debit_account.value == "79.1"
+        assert source_row.credit_account.value == source_account.value
+        assert source_row.debit_supplier_rvp == MANAGER_ORGANIZATION
+        assert source_row.credit_supplier_rvp == balance.supplier_rvp
+        assert gk_row.debit_supplier_rvp == balance.organization
+        assert gk_row.credit_supplier_rvp == balance.supplier_rvp
+    else:
+        assert source_row.debit_account.value == source_account.value
+        assert source_row.credit_account.value == "79.1"
+        assert source_row.debit_supplier_rvp == balance.supplier_rvp
+        assert source_row.credit_supplier_rvp == MANAGER_ORGANIZATION
+        assert gk_row.debit_supplier_rvp == balance.supplier_rvp
+        assert gk_row.credit_supplier_rvp == balance.organization
+
+
 def test_reference_configuration_supplies_manager_identity():
     balance = NormalizedBalance(
         period_end=date(2024, 12, 31),
@@ -133,6 +199,30 @@ def test_reference_configuration_supplies_manager_identity():
     assert source_row.debit_supplier_rvp == "MANAGER"
     assert manager_row.document_organization == "MANAGER"
     assert manager_row.debit_department == manager_row.credit_department == "MANAGER_FINANCE"
+
+
+def test_unsupported_rules_version_fails_closed_without_postings():
+    balance = NormalizedBalance(
+        period_end=date(2024, 12, 31),
+        source_excel_row_ref="synthetic:unsupported-rules-version",
+        organization="АТ",
+        source_account=SourceAccount.ACCOUNT_79_2,
+        department="Б_АТ Коммерческий отдел",
+        supplier_rvp="Производитель",
+        ending_debit=Decimal("1.00"),
+    )
+
+    result = generate_transfer(
+        balance,
+        TransferConfig(rules_version="H79_TRANSFER_V2"),
+    )
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.reason is BlockReason.INVALID_POSTING
+    assert result.rows == ()
+    assert result.message == (
+        "unsupported rules_version for transfer engine: H79_TRANSFER_V2"
+    )
 
 
 def test_zero_and_invalid_balances_generate_no_rows():

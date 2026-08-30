@@ -8,6 +8,7 @@ from decimal import Decimal
 
 from .config import TransferConfig
 from .models import (
+    RULES_VERSION,
     AccountCode,
     BalanceSide,
     BalanceStatus,
@@ -113,6 +114,15 @@ class TransferEngine:
             )
         if validation.status is BalanceStatus.NO_ACTION:
             return TransferResult(status=BalanceStatus.NO_ACTION)
+        if self.config.rules_version != RULES_VERSION:
+            return TransferResult(
+                status=BalanceStatus.BLOCKED,
+                reason=BlockReason.BLOCKED_INVALID_POSTING,
+                message=(
+                    "unsupported rules_version for transfer engine: "
+                    f"{self.config.rules_version}"
+                ),
+            )
 
         rows = _build_rows(balance, self.config)
         control = validate_source_effect(balance, rows, self.config)
@@ -262,13 +272,11 @@ def validate_source_effect(
     engine_config = config or TransferConfig()
     rows_tuple = tuple(rows)
     side = balance.ending_side
-    source_rows = [
-        row for row in rows_tuple if row.document_organization == balance.organization
-    ]
+    source_rows = [row for row in rows_tuple if _is_source_role(balance, row)]
     gk_rows = [
         row
         for row in rows_tuple
-        if row.document_organization == engine_config.manager_organization
+        if _is_gk_role(balance, row, engine_config)
     ]
     source_row = source_rows[0] if len(source_rows) == 1 else None
     gk_row = gk_rows[0] if len(gk_rows) == 1 else None
@@ -289,6 +297,7 @@ def validate_source_effect(
     source_consumed_once = (
         len(rows_tuple) == 2
         and len(source_rows) == 1
+        and len(gk_rows) == 1
         and source_row is not None
         and source_row.source_excel_row_ref == balance.source_excel_row_ref
     )
@@ -331,7 +340,12 @@ def _direction_is_correct(
     gk_row: PostingRow | None,
     config: TransferConfig,
 ) -> bool:
-    if source_row is None or gk_row is None or balance.ending_side is None:
+    if (
+        source_row is None
+        or gk_row is None
+        or balance.ending_side is None
+        or config.rules_version != RULES_VERSION
+    ):
         return False
     source_account = _source_account_code(balance.source_account)
     manager_account = AccountCode.ACCOUNT_79_1
@@ -396,6 +410,51 @@ def _direction_is_correct(
             and gk_row.credit_supplier_rvp == balance.organization
         )
     return source_trace_matches and source_direction and gk_direction
+
+
+def _is_source_role(balance: NormalizedBalance, row: PostingRow) -> bool:
+    """Identify the source-role row by its approved account direction."""
+
+    if row.document_organization != balance.organization or balance.ending_side is None:
+        return False
+    source_account = _source_account_code(balance.source_account)
+    manager_account = AccountCode.ACCOUNT_79_1
+    if balance.ending_side is BalanceSide.DEBIT:
+        return (
+            row.debit_account is manager_account and row.credit_account is source_account
+        )
+    if balance.ending_side is BalanceSide.CREDIT:
+        return (
+            row.debit_account is source_account and row.credit_account is manager_account
+        )
+    return False
+
+
+def _is_gk_role(
+    balance: NormalizedBalance, row: PostingRow, config: TransferConfig
+) -> bool:
+    """Identify the GK-role row by accounts, department, and supplier direction."""
+
+    manager_account = AccountCode.ACCOUNT_79_1
+    if not (
+        row.document_organization == config.manager_organization
+        and row.debit_account is manager_account
+        and row.credit_account is manager_account
+        and row.debit_department == config.manager_financial_department
+        and row.credit_department == config.manager_financial_department
+    ):
+        return False
+    if balance.ending_side is BalanceSide.DEBIT:
+        return (
+            row.debit_supplier_rvp == balance.organization
+            and row.credit_supplier_rvp == balance.supplier_rvp
+        )
+    if balance.ending_side is BalanceSide.CREDIT:
+        return (
+            row.debit_supplier_rvp == balance.supplier_rvp
+            and row.credit_supplier_rvp == balance.organization
+        )
+    return False
 
 
 def _source_effect_failure_message(control: SourceEffectControl) -> str:
