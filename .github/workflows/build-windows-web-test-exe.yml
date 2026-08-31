@@ -28,13 +28,14 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install ".[test]" pyinstaller
 
-      - name: Full regression suite
+      - name: Full accounting regression suite
         shell: pwsh
         run: |
           python -m pytest -q
-          python -m ruff check .
+          python -m ruff check src tests
           git diff --check
           python -c "import holding79_transfer; print(holding79_transfer.__version__)"
+          python -m py_compile tools/windows_web_app.py
 
       - name: Build web EXE
         shell: pwsh
