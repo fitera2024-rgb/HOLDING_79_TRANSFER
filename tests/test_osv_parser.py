@@ -432,10 +432,11 @@ def test_financial_payload_on_incomplete_non_leaf_context_blocks(rows, code):
     assert any(diagnostic.code is code for diagnostic in result.diagnostics)
 
 
-def test_explicit_hierarchy_aggregates_are_not_supplier_financial_leaves():
+@pytest.mark.parametrize("account", ["79.2", "79.3"])
+def test_explicit_hierarchy_aggregates_are_not_supplier_financial_leaves(account):
     result = parse(
         [
-            ("79.2", "400.00", 0, 0),
+            (account, "400.00", 0, 0),
             ("Организация: АТ", "300.00", 0, 1),
             ("ЦФО: ЦФО", "200.00", 0, 2),
             ("Поставщик РВП: Поставщик", "100.00", 0, 3),
@@ -445,7 +446,41 @@ def test_explicit_hierarchy_aggregates_are_not_supplier_financial_leaves():
     assert result.status is BalanceStatus.ACTIONABLE
     assert result.diagnostics == ()
     assert len(result.balances) == 1
+    assert result.balances[0].source_account.value == account
     assert result.balances[0].ending_debit == Decimal("100.00")
+
+
+@pytest.mark.parametrize("account", ["79.2", "79.3"])
+def test_supported_account_token_at_supplier_depth_with_payload_blocks_without_reset(account):
+    rows = leaf(account, "ORG_A", "DEPARTMENT_A", "SUPPLIER_A", "1.00")
+    rows += [
+        (account, "2.00", 0, 3),
+        ("Поставщик РВП: SUPPLIER_B", "3.00", 0, 3),
+    ]
+
+    result = parse(rows)
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.balances == ()
+    assert len(result.diagnostics) == 1
+    diagnostic = result.diagnostics[0]
+    assert diagnostic.code is ParserDiagnosticCode.AMBIGUOUS_HIERARCHY
+    assert diagnostic.excel_row == 10
+    assert "established account depth" in diagnostic.message
+
+
+@pytest.mark.parametrize("depth", [1, 2])
+def test_supported_account_token_at_other_non_account_depth_with_payload_blocks(depth):
+    rows = leaf("79.2", "ORG_A", "DEPARTMENT_A", "SUPPLIER_A", "1.00")
+    rows.append(("79.2", "2.00", 0, depth))
+
+    result = parse(rows)
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.balances == ()
+    assert len(result.diagnostics) == 1
+    assert result.diagnostics[0].code is ParserDiagnosticCode.AMBIGUOUS_HIERARCHY
+    assert result.diagnostics[0].excel_row == 10
 
 
 def test_unknown_financial_payload_after_complete_hierarchy_remains_fail_closed():

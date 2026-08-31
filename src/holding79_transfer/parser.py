@@ -1188,14 +1188,32 @@ class GroupedOsvParser:
             account = _row_account_token(ws, row, grouping_column, layout)
             if account is not None:
                 supported = _supported_account(account)
+                account_depth = _row_depth(
+                    ws,
+                    row,
+                    grouping_column,
+                    prefer_outline=state.prefer_outline_depth,
+                )
+                if (
+                    supported is not None
+                    and state.account is not None
+                    and account_depth is not None
+                    and account_depth != state.account_depth
+                ):
+                    diagnostics.append(
+                        _diagnostic(
+                            ParserDiagnosticCode.AMBIGUOUS_HIERARCHY,
+                            f"supported account token depth {account_depth} conflicts with "
+                            f"established account depth {state.account_depth}",
+                            ws,
+                            row,
+                            grouping_column,
+                        )
+                    )
+                    continue
                 state.reset_for_account(
                     supported,
-                    _row_depth(
-                        ws,
-                        row,
-                        grouping_column,
-                        prefer_outline=state.prefer_outline_depth,
-                    ),
+                    account_depth,
                 )
                 if supported is None:
                     diagnostics.append(
