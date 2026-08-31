@@ -76,7 +76,7 @@ def test_synthetic_run_publishes_all_artifacts_and_controls(tmp_path: Path):
         assert control_workbook.sheetnames == list(CONTROL_SHEET_NAMES)
         blocked_rows = list(control_workbook["Блокировки"].iter_rows(values_only=True))
         assert blocked_rows[1][0] == "BLOCKED_SOURCE_ROW!R9"
-        assert blocked_rows[1][4] == "MISSING_SUPPLIER_RVP"
+        assert blocked_rows[1][4] == "MISSING_ORGANIZATION"
         assert blocked_rows[1][7:9] == (0, 0)
         effect_rows = list(control_workbook["Контроль_до_после"].iter_rows(values_only=True))
         assert len(effect_rows) == 5
@@ -118,6 +118,52 @@ def test_blocked_parser_row_has_no_financial_output_and_is_retained_in_manifests
         "BLOCKED_SOURCE_ROW!R9" not in str(record)
         for record in export_manifest["workbooks"]
     )
+
+
+def test_integration_publishes_disputed_suffix_only_for_affected_organization(
+    tmp_path: Path,
+):
+    workbook = build_synthetic_osv_workbook()
+    complete = workbook["DEBIT_79_2_AT"]
+    disputed = workbook.copy_worksheet(complete)
+    disputed.title = "DISPUTED_DEPARTMENT"
+    disputed["A7"] = "Организация: БТ"
+    disputed["A8"] = "ЦФО"
+    for sheet_name in list(workbook.sheetnames):
+        if sheet_name not in {"DEBIT_79_2_AT", "DISPUTED_DEPARTMENT"}:
+            workbook.remove(workbook[sheet_name])
+
+    try:
+        result = run_integration(workbook, tmp_path / "run", period_end="2024-12-31")
+    finally:
+        workbook.close()
+
+    assert result.is_success
+    assert result.diagnostics == ()
+    assert {path.name for path in (result.output_dir / "export").glob("*.xlsx")} == {
+        "2024-12-31__АТ.xlsx",
+        "2024-12-31__БТ_СПОРНО.xlsx",
+        "2024-12-31__ГК.xlsx",
+    }
+    balances = read_jsonl(result.output_dir / "normalized_balances.jsonl")
+    disputed_balance = next(
+        record for record in balances if record["organization"] == "БТ"
+    )
+    assert disputed_balance["department"] == ""
+    assert disputed_balance["supplier_rvp"] == "Производитель"
+
+    disputed_workbook = load_workbook(
+        result.output_dir / "export" / "2024-12-31__БТ_СПОРНО.xlsx",
+        read_only=True,
+    )
+    try:
+        worksheet = disputed_workbook[OUTPUT_SHEET_NAME]
+        assert worksheet.max_column == 27
+        assert worksheet.cell(2, 6).value is None
+        assert worksheet.cell(2, 7).value is None
+        assert worksheet.cell(2, 25).value == "Производитель"
+    finally:
+        disputed_workbook.close()
 
 
 def test_same_normalized_input_is_byte_stable_for_financial_artifacts(tmp_path: Path):
@@ -192,7 +238,7 @@ def test_all_blocked_parser_source_is_auditable_with_empty_financial_output(tmp_
     assert result.normalized_balances == ()
     assert result.posting_rows == ()
     assert len(result.diagnostics) == 1
-    assert result.diagnostics[0].code.value == "MISSING_SUPPLIER_RVP"
+    assert result.diagnostics[0].code.value == "MISSING_ORGANIZATION"
 
     assert read_jsonl(result.output_dir / "normalized_balances.jsonl") == []
     assert read_jsonl(result.output_dir / "posting_rows.jsonl") == []
@@ -342,7 +388,7 @@ def test_on_disk_synthetic_input_uses_the_same_pipeline(tmp_path: Path):
 
     assert result.is_success
     assert len(result.posting_rows) == 8
-    assert result.diagnostics[0].code.value == "MISSING_SUPPLIER_RVP"
+    assert result.diagnostics[0].code.value == "MISSING_ORGANIZATION"
 
 
 def test_run_fails_closed_without_publishing_partial_outputs(tmp_path: Path):

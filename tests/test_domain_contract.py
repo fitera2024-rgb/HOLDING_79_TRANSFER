@@ -90,6 +90,26 @@ def test_zero_balance_is_no_action_and_missing_identity_is_blocked():
 
 
 @pytest.mark.parametrize(
+    ("department", "supplier"),
+    (("", "Производитель"), ("Б_АТ Коммерческий отдел", ""), ("", "")),
+)
+def test_known_organization_allows_blank_lower_analytics(department, supplier):
+    balance = NormalizedBalance(
+        period_end=date(2024, 12, 31),
+        source_excel_row_ref="synthetic:blank-lower-analytics",
+        organization="АТ",
+        source_account="79.2",
+        department=department,
+        supplier_rvp=supplier,
+        ending_debit="1.00",
+    )
+
+    assert balance.status is BalanceStatus.ACTIONABLE
+    assert balance.department == department
+    assert balance.supplier_rvp == supplier
+
+
+@pytest.mark.parametrize(
     ("side", "account_token"),
     [
         ("debit", "79_2"),

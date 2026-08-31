@@ -214,8 +214,6 @@ def validate_normalized_balance(balance: NormalizedBalance) -> ValidationResult:
         "period_end": balance.period_end,
         "organization": balance.organization,
         "source_account": balance.source_account,
-        "department": balance.department,
-        "supplier_rvp": balance.supplier_rvp,
         "source_excel_row_ref": balance.source_excel_row_ref,
     }
     if any(not value for value in missing.values()):
@@ -307,13 +305,7 @@ def validate_posting_row(row: PostingRow) -> ValidationResult:
         "document_organization": row.document_organization,
         "source_organization": row.source_organization,
         "source_account": row.source_account,
-        "source_department": row.source_department,
-        "source_supplier_rvp": row.source_supplier_rvp,
         "source_excel_row_ref": row.source_excel_row_ref,
-        "debit_department": row.debit_department,
-        "debit_supplier_rvp": row.debit_supplier_rvp,
-        "credit_department": row.credit_department,
-        "credit_supplier_rvp": row.credit_supplier_rvp,
         "side": row.side,
         "financial_record_id": row.financial_record_id,
     }

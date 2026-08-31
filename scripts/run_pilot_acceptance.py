@@ -203,7 +203,7 @@ def _validate_artifacts_and_controls(root: Path, result: Any) -> dict[str, Any]:
     _assert(actual_sheets == expected_sheets, "synthetic source sheet identification changed")
     _assert(len(manifest["parser_diagnostics"]) == 1, "blocked source diagnostic is missing")
     blocked_diagnostic = manifest["parser_diagnostics"][0]
-    _assert(blocked_diagnostic["code"] == "MISSING_SUPPLIER_RVP", "wrong blocked-source reason")
+    _assert(blocked_diagnostic["code"] == "MISSING_ORGANIZATION", "wrong blocked-source reason")
     blocked_ref = blocked_diagnostic["source_excel_row_ref"]
 
     normalized = _read_jsonl(root / "normalized_balances.jsonl")
@@ -331,6 +331,57 @@ def _malformed_source_probes(source: bytes) -> None:
     _assert(result.message == "source workbook is not a valid XLSX file", "raw workbook exception escaped parser")
 
 
+def _disputed_blank_analytics_probe(parent: Path) -> None:
+    expected_paths = {
+        "export/2024-12-31__АТ.xlsx",
+        "export/2024-12-31__БТ_СПОРНО.xlsx",
+        "export/2024-12-31__ГК.xlsx",
+    }
+    manifests: list[list[dict[str, Any]]] = []
+    for run_number in (1, 2):
+        workbook = build_synthetic_osv_workbook()
+        complete = workbook["DEBIT_79_2_AT"]
+        disputed = workbook.copy_worksheet(complete)
+        disputed.title = "DISPUTED_DEPARTMENT"
+        disputed["A7"] = "Организация: БТ"
+        disputed["A8"] = "ЦФО"
+        for sheet_name in list(workbook.sheetnames):
+            if sheet_name not in {"DEBIT_79_2_AT", "DISPUTED_DEPARTMENT"}:
+                workbook.remove(workbook[sheet_name])
+        output = parent / f"disputed-probe-{run_number}"
+        try:
+            run_integration(workbook, output, period_end="2024-12-31")
+        finally:
+            workbook.close()
+
+        manifest = _read_json(output / "export_manifest.json")
+        manifests.append(manifest["workbooks"])
+        actual_paths = {record["path"] for record in manifest["workbooks"]}
+        _assert(actual_paths == expected_paths, "disputed suffix leaked across organizations")
+        normalized = _read_jsonl(output / "normalized_balances.jsonl")
+        disputed_balance = next(
+            record for record in normalized if record["organization"] == "БТ"
+        )
+        _assert(disputed_balance["department"] == "", "missing department was not blank")
+        _assert(
+            disputed_balance["supplier_rvp"] == "Производитель",
+            "known supplier was not preserved",
+        )
+        disputed_path = output / "export" / "2024-12-31__БТ_СПОРНО.xlsx"
+        exported = load_workbook(disputed_path, read_only=True, data_only=False)
+        try:
+            worksheet = exported[OUTPUT_SHEET_NAME]
+            _assert(worksheet.max_column == 27, "disputed workbook is not 27 columns")
+            _assert(
+                worksheet.cell(2, 6).value is None
+                and worksheet.cell(2, 7).value is None,
+                "missing department did not round-trip as empty cells",
+            )
+        finally:
+            exported.close()
+    _assert(manifests[0] == manifests[1], "disputed filenames differ on rerun")
+
+
 def _failed_run_atomicity_probe(repo_root: Path, parent: Path) -> None:
     with tempfile.TemporaryDirectory(prefix=".pilot-failure-", dir=parent) as temp_name:
         output = Path(temp_name) / "failed-run"
@@ -383,6 +434,7 @@ def run(output_dir: Path) -> None:
         second_evidence = _validate_artifacts_and_controls(second_root, second_result)
         _assert_deterministic(first_root, second_root, first_evidence, second_evidence)
 
+        _disputed_blank_analytics_probe(staging_root)
         _malformed_source_probes(source)
         _failed_run_atomicity_probe(REPO_ROOT, staging_root)
 
@@ -403,6 +455,7 @@ def run(output_dir: Path) -> None:
     print("malformed_xlsx_invalid_source=PASS")
     print("failed_run_atomicity=PASS")
     print("deterministic_rerun=PASS")
+    print("disputed_blank_analytics=PASS")
     print(f"ARTIFACTS={len(list(output_dir.rglob('*')))} files/directories under {output_dir.name}")
     print("ACCEPTANCE=PASS")
 

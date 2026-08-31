@@ -261,8 +261,108 @@ def test_genuinely_different_safe_filenames_do_not_collide(tmp_path: Path):
     }
 
 
+def test_disputed_suffix_does_not_bypass_sanitization_collision_protection(
+    tmp_path: Path,
+):
+    complete = make_posting_row(
+        organization="A/B", source_ref="synthetic:complete-alias"
+    )
+    incomplete_balance = make_balance(
+        organization="A\\B", source_ref="synthetic:disputed-alias"
+    ).model_copy(update={"department": ""})
+    incomplete = generate_transfer(incomplete_balance).rows[0]
+
+    with pytest.raises(FilenameCollisionError, match="filename collision"):
+        export_posting_rows((complete, incomplete), tmp_path)
+
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_sanitization_collision_filename_remains_deterministic():
     assert deterministic_filename(date(2024, 12, 31), "A/B") == "2024-12-31__A_B.xlsx"
+    assert deterministic_filename(
+        date(2024, 12, 31), "A/B", disputed=True
+    ) == "2024-12-31__A_B_СПОРНО.xlsx"
+
+
+def test_disputed_suffix_isolated_per_date_and_organization(tmp_path: Path):
+    complete = generate_transfer(
+        make_balance(organization="ORG_A", source_ref="synthetic:complete")
+    ).rows[0]
+    incomplete_balance = make_balance(
+        organization="ORG_B", source_ref="synthetic:incomplete"
+    ).model_copy(update={"department": ""})
+    incomplete = generate_transfer(incomplete_balance).rows[0]
+
+    result = export_posting_rows((incomplete, complete), tmp_path)
+
+    assert {path.name for path in result.paths} == {
+        "2024-12-31__ORG_A.xlsx",
+        "2024-12-31__ORG_B_СПОРНО.xlsx",
+    }
+
+
+def test_complete_and_incomplete_rows_share_one_disputed_organization_file(tmp_path: Path):
+    complete_rows = [
+        generate_transfer(
+            make_balance(organization="ORG_A", source_ref=f"synthetic:complete-{index}")
+        ).rows[0]
+        for index in range(10)
+    ]
+    incomplete_balance = make_balance(
+        organization="ORG_A", source_ref="synthetic:incomplete"
+    ).model_copy(update={"department": ""})
+    incomplete = generate_transfer(incomplete_balance).rows[0]
+
+    result = export_posting_rows((*complete_rows, incomplete), tmp_path)
+
+    assert [path.name for path in result.paths] == [
+        "2024-12-31__ORG_A_СПОРНО.xlsx"
+    ]
+    _, rows, _ = read_rows(result.paths[0])
+    assert len(rows) == 11
+
+
+def test_blank_analytics_round_trip_as_empty_cells_with_exact_schema(tmp_path: Path):
+    balance = make_balance(
+        organization="ORG_A", source_ref="synthetic:both-blank"
+    ).model_copy(update={"department": "", "supplier_rvp": ""})
+    row = generate_transfer(balance).rows[0]
+
+    result = export_posting_rows((row,), tmp_path)
+
+    assert result.paths[0].name == "2024-12-31__ORG_A_СПОРНО.xlsx"
+    header, rows, sheetnames = read_rows(result.paths[0])
+    assert sheetnames == [OUTPUT_SHEET_NAME]
+    assert header == list(OUTPUT_HEADERS)
+    assert len(header) == 27
+    record = dict(zip(header, rows[0], strict=True))
+    assert record["ПодразделениеДт"] is None
+    assert record["ПодразделениеКт"] is None
+    assert record["СубконтоКт1"] is None
+    non_empty_text = {str(value) for value in rows[0] if value is not None}
+    assert not ({"None", "null", "СПОРНО", "-", "N/A"} & non_empty_text)
+    validate_workbook_round_trip(result.paths[0], (row,))
+
+
+def test_disputed_filename_and_rows_are_deterministic(tmp_path: Path):
+    complete = generate_transfer(
+        make_balance(organization="ORG_A", source_ref="synthetic:complete")
+    ).rows[0]
+    incomplete = generate_transfer(
+        make_balance(organization="ORG_A", source_ref="synthetic:incomplete").model_copy(
+            update={"supplier_rvp": ""}
+        )
+    ).rows[0]
+
+    first = export_posting_rows((complete, incomplete), tmp_path / "first")
+    second = export_posting_rows((incomplete, complete), tmp_path / "second")
+
+    assert [path.name for path in first.paths] == [path.name for path in second.paths]
+    assert [path.name for path in first.paths] == [
+        "2024-12-31__ORG_A_СПОРНО.xlsx"
+    ]
+    assert read_rows(first.paths[0]) == read_rows(second.paths[0])
 
 
 def test_incomplete_posting_is_blocked_before_any_file_is_published(tmp_path: Path):

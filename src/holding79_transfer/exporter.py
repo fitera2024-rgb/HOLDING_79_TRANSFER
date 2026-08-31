@@ -174,16 +174,40 @@ def sanitize_filename_component(value: str) -> str:
     return component[:_MAX_FILENAME_COMPONENT_LENGTH]
 
 
-def deterministic_filename(document_date: date, document_organization: str) -> str:
+def deterministic_filename(
+    document_date: date,
+    document_organization: str,
+    *,
+    disputed: bool = False,
+) -> str:
     """Build the stable safe filename for one date/organization group."""
 
     if not isinstance(document_date, date):
         raise TypeError("document_date must be a date")
     if not isinstance(document_organization, str) or not document_organization.strip():
         raise ValueError("document_organization must be a non-empty string")
+    if not isinstance(disputed, bool):
+        raise TypeError("disputed must be a bool")
+    suffix = "_СПОРНО" if disputed else ""
     return (
         f"{document_date.isoformat()}__"
-        f"{sanitize_filename_component(document_organization)}.xlsx"
+        f"{sanitize_filename_component(document_organization)}{suffix}.xlsx"
+    )
+
+
+def posting_has_blank_lower_analytics(row: PostingRow) -> bool:
+    """Return whether an output posting has an absent department or supplier."""
+
+    if not isinstance(row, PostingRow):
+        raise TypeError("row must be a PostingRow")
+    return any(
+        not value
+        for value in (
+            row.debit_department,
+            row.credit_department,
+            row.debit_supplier_rvp,
+            row.credit_supplier_rvp,
+        )
     )
 
 
@@ -300,17 +324,30 @@ def _check_filename_collisions(
     groups: Mapping[tuple[date, str], Sequence[_MappedPosting]],
 ) -> dict[tuple[date, str], str]:
     names: dict[tuple[date, str], str] = {}
-    owners: dict[str, tuple[date, str]] = {}
+    component_owners: dict[str, tuple[date, str]] = {}
+    filename_owners: dict[str, tuple[date, str]] = {}
     for group in sorted(groups):
-        filename = deterministic_filename(*group)
-        collision_key = filename.casefold()
-        previous = owners.get(collision_key)
+        disputed = any(
+            posting_has_blank_lower_analytics(mapped.source)
+            for mapped in groups[group]
+        )
+        filename = deterministic_filename(*group, disputed=disputed)
+        component_key = deterministic_filename(*group).casefold()
+        previous = component_owners.get(component_key)
         if previous is not None and previous != group:
             raise FilenameCollisionError(
                 f"filename collision: {filename!r} represents both "
                 f"{previous!r} and {group!r}"
             )
-        owners[collision_key] = group
+        filename_key = filename.casefold()
+        previous = filename_owners.get(filename_key)
+        if previous is not None and previous != group:
+            raise FilenameCollisionError(
+                f"filename collision: {filename!r} represents both "
+                f"{previous!r} and {group!r}"
+            )
+        component_owners[component_key] = group
+        filename_owners[filename_key] = group
         names[group] = filename
     return names
 
@@ -581,6 +618,7 @@ __all__ = [
     "export",
     "export_posting_rows",
     "export_posting_rows_to_xlsx",
+    "posting_has_blank_lower_analytics",
     "sanitize_filename_component",
     "validate_workbook_round_trip",
     "write_xlsx",
