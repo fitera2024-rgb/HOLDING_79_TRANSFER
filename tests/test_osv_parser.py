@@ -14,6 +14,7 @@ from holding79_transfer import (
     GroupedOsvParser,
     ParserDiagnostic,
     ParserDiagnosticCode,
+    TransferEngine,
     parse_grouped_osv,
 )
 from holding79_transfer.parser import _detect_ending_columns, _find_grouping_column
@@ -705,6 +706,105 @@ def make_merged_hierarchy_workbook(*, account: str = "79.2") -> Workbook:
     return workbook
 
 
+def append_root_grand_total_pair(
+    workbook: Workbook,
+    *,
+    debit: object = "400.00",
+    credit: object = 0,
+    turnover_debit: object = "375.00",
+    continuation_debit: object | None = None,
+    continuation_credit: object | None = None,
+    continuation_turnover_debit: object | None = None,
+) -> None:
+    """Append the real-source shape of a merged root OV/FV report total."""
+
+    worksheet = workbook.active
+    worksheet.merge_cells("G8:H8")
+    worksheet["G8"] = "Сальдо на начало периода"
+    worksheet["G9"] = "Дебет"
+    worksheet["H9"] = "Кредит"
+    worksheet.merge_cells("I8:J8")
+    worksheet["I8"] = "Обороты за период"
+    worksheet["I9"] = "Дебет"
+    worksheet["J9"] = "Кредит"
+    for aggregate_row in (10, 11):
+        worksheet.cell(aggregate_row, 7).value = "25.00"
+        worksheet.cell(aggregate_row, 8).value = 0
+        worksheet.cell(aggregate_row, 9).value = "375.00"
+        worksheet.cell(aggregate_row, 10).value = 0
+
+    row = worksheet.max_row + 1
+    worksheet.merge_cells(
+        start_row=row,
+        start_column=3,
+        end_row=row + 1,
+        end_column=5,
+    )
+    worksheet.cell(row, 3).value = "Итого"
+    worksheet.cell(row, 3).alignment = Alignment(indent=0)
+    worksheet.cell(row, 6).value = "ОВ"
+    worksheet.cell(row + 1, 6).value = "ФВ"
+    worksheet.cell(row, 7).value = "25.00"
+    worksheet.cell(row, 8).value = 0
+    worksheet.cell(row, 9).value = turnover_debit
+    worksheet.cell(row, 10).value = 0
+    worksheet.cell(row, 11).value = debit
+    worksheet.cell(row, 12).value = credit
+    worksheet.cell(row + 1, 7).value = "25.00"
+    worksheet.cell(row + 1, 8).value = 0
+    worksheet.cell(row + 1, 9).value = (
+        turnover_debit
+        if continuation_turnover_debit is None
+        else continuation_turnover_debit
+    )
+    worksheet.cell(row + 1, 10).value = 0
+    worksheet.cell(row + 1, 11).value = (
+        debit if continuation_debit is None else continuation_debit
+    )
+    worksheet.cell(row + 1, 12).value = (
+        credit if continuation_credit is None else continuation_credit
+    )
+    worksheet.row_dimensions[row].outlineLevel = 0
+    worksheet.row_dimensions[row + 1].outlineLevel = 0
+
+
+def append_merged_leaf_pair(
+    workbook: Workbook,
+    *,
+    organization: str,
+    department: str,
+    supplier: str,
+    debit: object = "100.00",
+) -> int:
+    """Append one merged outline leaf and return its financial anchor row."""
+
+    worksheet = workbook.active
+    first_row = worksheet.max_row + 1
+    for row, identity, amount, indent, outline_level in (
+        (first_row, organization, 0, 2, 1),
+        (first_row + 2, department or None, 0, 4, 2),
+        (first_row + 4, supplier or None, debit, 6, 3),
+    ):
+        worksheet.merge_cells(
+            start_row=row,
+            start_column=3,
+            end_row=row + 1,
+            end_column=5,
+        )
+        cell = worksheet.cell(row, 3)
+        cell.value = identity
+        cell.alignment = Alignment(indent=indent)
+        worksheet.cell(row, 6).value = "ОВ"
+        worksheet.cell(row + 1, 6).value = "ФВ"
+        worksheet.cell(row, 11).value = amount
+        worksheet.cell(row, 12).value = 0
+        worksheet.cell(row + 1, 11).value = amount
+        worksheet.cell(row + 1, 12).value = 0
+        worksheet.row_dimensions[row].outlineLevel = outline_level
+        worksheet.row_dimensions[row + 1].outlineLevel = outline_level
+    return first_row + 4
+
+
 def test_real_r94_shape_exports_blank_department_and_supplier():
     workbook = make_merged_hierarchy_workbook()
     worksheet = workbook.active
@@ -846,6 +946,140 @@ def test_merged_outline_hierarchy_aggregates_are_context_not_financial_leaves(ac
     assert balance.supplier_rvp == "SUPPLIER_A"
     assert balance.ending_debit == Decimal("100.00")
     assert balance.source_excel_row_ref == "Лист_1!R16"
+
+
+@pytest.mark.parametrize("account", ["79.2", "79.3"])
+def test_root_grand_total_ov_fv_pair_is_not_a_financial_leaf(account):
+    workbook = make_merged_hierarchy_workbook(account=account)
+    append_root_grand_total_pair(workbook)
+
+    result = parse_grouped_osv(workbook, period_end=date(2024, 12, 31))
+
+    assert result.status is BalanceStatus.ACTIONABLE
+    assert result.diagnostics == ()
+    assert len(result.balances) == 1
+    assert result.balances[0].supplier_rvp == "SUPPLIER_A"
+    assert result.balances[0].source_excel_row_ref == "Лист_1!R16"
+    batch = TransferEngine().generate_batch(result.balances)
+    assert batch.status is BalanceStatus.ACTIONABLE
+    assert len(batch.rows) == 2
+    assert {row.source_excel_row_ref for row in batch.rows} == {"Лист_1!R16"}
+
+
+@pytest.mark.parametrize(
+    ("department", "supplier"),
+    (("", "SUPPLIER_A"), ("DEPARTMENT_A", ""), ("", "")),
+    ids=("blank-department", "blank-supplier", "blank-both"),
+)
+def test_root_grand_total_is_independent_of_preceding_blank_lower_analytics(
+    department,
+    supplier,
+):
+    def parse_variant(*, with_total: bool):
+        workbook = make_merged_hierarchy_workbook()
+        worksheet = workbook.active
+        worksheet["C12"] = "ORG_BASE"
+        worksheet["C14"] = "DEPARTMENT_BASE"
+        worksheet["C16"] = "SUPPLIER_BASE"
+        leaf_row = append_merged_leaf_pair(
+            workbook,
+            organization="ORG_A",
+            department=department,
+            supplier=supplier,
+        )
+        total_row = worksheet.max_row + 1
+        if with_total:
+            append_root_grand_total_pair(workbook)
+        result = parse_grouped_osv(workbook, period_end=date(2024, 12, 31))
+        batch = TransferEngine().generate_batch(result.balances)
+        return result, batch, leaf_row, total_row
+
+    baseline, baseline_batch, leaf_row, _ = parse_variant(with_total=False)
+    with_total, with_total_batch, _, total_row = parse_variant(with_total=True)
+
+    assert baseline.status is BalanceStatus.ACTIONABLE
+    assert baseline.diagnostics == ()
+    assert with_total.status is BalanceStatus.ACTIONABLE
+    assert with_total.diagnostics == ()
+    assert with_total.balances == baseline.balances
+    assert with_total_batch.rows == baseline_batch.rows
+    assert len(with_total.balances) == 2
+    assert len(with_total_batch.rows) == 4
+    preceding_leaf = next(
+        balance for balance in with_total.balances if balance.organization == "ORG_A"
+    )
+    assert preceding_leaf.department == department
+    assert preceding_leaf.supplier_rvp == supplier
+    assert preceding_leaf.source_excel_row_ref == f"Лист_1!R{leaf_row}"
+    assert {row.source_excel_row_ref for row in with_total_batch.rows} == {
+        "Лист_1!R16",
+        f"Лист_1!R{leaf_row}",
+    }
+    assert all(
+        row.source_excel_row_ref
+        not in {f"Лист_1!R{total_row}", f"Лист_1!R{total_row + 1}"}
+        for row in with_total_batch.rows
+    )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda workbook: append_root_grand_total_pair(workbook, debit="399.00"),
+        lambda workbook: append_root_grand_total_pair(
+            workbook,
+            turnover_debit="374.00",
+        ),
+        lambda workbook: append_root_grand_total_pair(
+            workbook,
+            continuation_debit="401.00",
+        ),
+        lambda workbook: append_root_grand_total_pair(
+            workbook,
+            continuation_turnover_debit="376.00",
+        ),
+    ],
+    ids=[
+        "ending-not-account-aggregate",
+        "turnover-not-account-aggregate",
+        "conflicting-ending-ov-fv",
+        "conflicting-turnover-ov-fv",
+    ],
+)
+def test_unproven_root_total_pair_remains_fail_closed(mutate):
+    workbook = make_merged_hierarchy_workbook()
+    mutate(workbook)
+
+    result = parse_grouped_osv(workbook, period_end=date(2024, 12, 31))
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.balances == ()
+    assert any(
+        diagnostic.code is ParserDiagnosticCode.AMBIGUOUS_HIERARCHY
+        for diagnostic in result.diagnostics
+    )
+
+
+@pytest.mark.parametrize("grouping", ["Unproven root payload", ""])
+def test_ordinary_root_financial_payload_is_not_silently_skipped(grouping):
+    workbook = make_merged_hierarchy_workbook()
+    worksheet = workbook.active
+    row = worksheet.max_row + 1
+    worksheet.cell(row, 3).value = grouping
+    worksheet.cell(row, 3).alignment = Alignment(indent=0)
+    worksheet.cell(row, 11).value = "400.00"
+    worksheet.cell(row, 12).value = 0
+    worksheet.row_dimensions[row].outlineLevel = 0
+
+    result = parse_grouped_osv(workbook, period_end=date(2024, 12, 31))
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.balances == ()
+    assert any(
+        diagnostic.code is ParserDiagnosticCode.AMBIGUOUS_HIERARCHY
+        and diagnostic.excel_row == row
+        for diagnostic in result.diagnostics
+    )
 
 
 def test_merged_technical_continuation_with_conflicting_payload_remains_fail_closed():
