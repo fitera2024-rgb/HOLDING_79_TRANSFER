@@ -209,6 +209,7 @@ class _HierarchyState:
     supplier_rvp: str | None = None
     account_depth: int = 0
     role_depths: dict[str, int] | None = None
+    prefer_outline_depth: bool = False
 
     def __post_init__(self) -> None:
         if self.role_depths is None:
@@ -622,7 +623,70 @@ def _find_grouping_column(
     return next(iter(candidates))
 
 
-def _row_depth(ws: Worksheet, row: int, grouping_column: int) -> int | None:
+def _has_coherent_outline_hierarchy(
+    ws: Worksheet,
+    grouping_column: int,
+    layout: EndingBalanceColumns,
+) -> bool:
+    """Return whether outline levels encode a complete supported hierarchy.
+
+    Default ``outlineLevel=0`` metadata is not evidence. A positive outline
+    scale becomes semantic only after a supported account contains a coherent
+    organization -> department -> supplier chain at levels 1 -> 2 -> 3.
+    """
+
+    active_supported_account = False
+    seen_levels: set[int] = set()
+    for row in range(layout.header_rows[-1] + 1, ws.max_row + 1):
+        account = _row_account_token(ws, row, grouping_column, layout)
+        if account is not None:
+            active_supported_account = (
+                _supported_account(account) is not None
+                and ws.row_dimensions[row].outlineLevel == 0
+            )
+            seen_levels = set()
+            continue
+        if not active_supported_account:
+            continue
+
+        value = ws.cell(row, grouping_column).value
+        if not _display_text(value):
+            continue
+        marker = _role_marker(value)
+        if marker is not None and marker[0] in {"technical", "total"}:
+            continue
+
+        outline_level = int(ws.row_dimensions[row].outlineLevel)
+        if outline_level not in {1, 2, 3}:
+            continue
+        expected_level = {
+            "organization": 1,
+            "department": 2,
+            "supplier": 3,
+        }.get(marker[0] if marker is not None else "")
+        if expected_level is not None and outline_level != expected_level:
+            return False
+        if outline_level == 1:
+            seen_levels = {1}
+        elif outline_level - 1 not in seen_levels:
+            return False
+        else:
+            seen_levels.add(outline_level)
+        if {1, 2, 3}.issubset(seen_levels):
+            return True
+    return False
+
+
+def _row_depth(
+    ws: Worksheet,
+    row: int,
+    grouping_column: int,
+    *,
+    prefer_outline: bool = False,
+) -> int | None:
+    outline_level = ws.row_dimensions[row].outlineLevel
+    if prefer_outline:
+        return int(outline_level)
     value = ws.cell(row, grouping_column).value
     leading = _leading_indent(value)
     if leading is not None:
@@ -630,7 +694,6 @@ def _row_depth(ws: Worksheet, row: int, grouping_column: int) -> int | None:
     indent = ws.cell(row, grouping_column).alignment.indent
     if indent is not None and indent > 0:
         return int(indent)
-    outline_level = ws.row_dimensions[row].outlineLevel
     if outline_level > 0:
         return int(outline_level)
     return None
@@ -674,7 +737,12 @@ def _technical_row_classification(
     marker = _role_marker(ws.cell(row, grouping_column).value)
     if marker is None or marker[0] != "technical":
         return False
-    depth = _row_depth(ws, row, grouping_column)
+    depth = _row_depth(
+        ws,
+        row,
+        grouping_column,
+        prefer_outline=state.prefer_outline_depth,
+    )
     if depth is None or state.role_depths is None:
         return None
     supplier_depth = state.role_depths.get("supplier")
@@ -753,6 +821,91 @@ def _has_balance_payload(ws: Worksheet, row: int, layout: EndingBalanceColumns) 
     return False
 
 
+def _is_merged_technical_continuation(
+    ws: Worksheet,
+    row: int,
+    grouping_column: int,
+    layout: EndingBalanceColumns,
+    state: _HierarchyState,
+) -> bool:
+    """Recognize the second presentation row of a merged ОВ/ФВ hierarchy pair."""
+
+    span = next(
+        (
+            merged
+            for merged in ws.merged_cells.ranges
+            if merged.min_col == grouping_column
+            and merged.min_row < row <= merged.max_row
+            and merged.min_col <= grouping_column <= merged.max_col
+        ),
+        None,
+    )
+    if span is None or not _display_text(ws.cell(span.min_row, span.min_col).value):
+        return False
+
+    measure_columns = _measure_columns_from_headers(
+        ws,
+        min(layout.header_rows),
+        layout.header_rows[-1] + 1,
+    )
+    grouping_columns = set(range(span.min_col, span.max_col + 1))
+
+    def technical_token(candidate_row: int) -> str | None:
+        tokens: list[str] = []
+        for column in range(1, ws.max_column + 1):
+            if column in grouping_columns or column in measure_columns:
+                continue
+            value = ws.cell(candidate_row, column).value
+            if not _display_text(value):
+                continue
+            match = re.fullmatch(r"(ов|фв)(?:\s*[:\-].*)?", _normalize_text(value))
+            if match is None:
+                return None
+            tokens.append(match.group(1))
+        return tokens[0] if len(tokens) == 1 else None
+
+    anchor_token = technical_token(span.min_row)
+    continuation_token = technical_token(row)
+    if {anchor_token, continuation_token} != {"ов", "фв"}:
+        return False
+
+    try:
+        anchor_balance = tuple(
+            _excel_decimal(ws.cell(span.min_row, column).value)
+            for column in (layout.debit_column, layout.credit_column)
+        )
+        continuation_balance = tuple(
+            _excel_decimal(ws.cell(row, column).value)
+            for column in (layout.debit_column, layout.credit_column)
+        )
+    except (TypeError, ValueError):
+        return False
+    if anchor_balance != continuation_balance:
+        return False
+
+    account = _row_account_token(ws, span.min_row, grouping_column, layout)
+    if account is not None:
+        return state.account is not None and state.account is _supported_account(account)
+
+    anchor_depth = _row_depth(
+        ws,
+        span.min_row,
+        grouping_column,
+        prefer_outline=state.prefer_outline_depth,
+    )
+    identities = {
+        "organization": state.organization,
+        "department": state.department,
+        "supplier": state.supplier_rvp,
+    }
+    return any(
+        identity
+        and state.role_depths is not None
+        and state.role_depths.get(role) == anchor_depth
+        for role, identity in identities.items()
+    )
+
+
 def _missing_context_code(state: _HierarchyState) -> ParserDiagnosticCode | None:
     if state.account is None:
         return ParserDiagnosticCode.MISSING_ACCOUNT_CONTEXT
@@ -783,8 +936,18 @@ def _is_presentation_duplicate(
     if current_row <= previous_row + 1:
         return False
     supplier_depth = state.role_depths.get("supplier") if state.role_depths else None
-    previous_depth = _row_depth(ws, previous_row, grouping_column)
-    current_depth = _row_depth(ws, current_row, grouping_column)
+    previous_depth = _row_depth(
+        ws,
+        previous_row,
+        grouping_column,
+        prefer_outline=state.prefer_outline_depth,
+    )
+    current_depth = _row_depth(
+        ws,
+        current_row,
+        grouping_column,
+        prefer_outline=state.prefer_outline_depth,
+    )
     if (
         supplier_depth is None
         or previous_depth is None
@@ -804,7 +967,12 @@ def _is_presentation_duplicate(
             # Any unlabelled supplier-level row is a real leaf even when its
             # amount is zero.  A non-zero payload at any other row is also
             # evidence that this is not one repeated presentation.
-            if _row_depth(ws, row, grouping_column) == supplier_depth and _display_text(
+            if _row_depth(
+                ws,
+                row,
+                grouping_column,
+                prefer_outline=state.prefer_outline_depth,
+            ) == supplier_depth and _display_text(
                 ws.cell(row, grouping_column).value
             ):
                 return False
@@ -814,12 +982,22 @@ def _is_presentation_duplicate(
         if marker[0] == "technical":
             if _technical_row_classification(ws, row, grouping_column, state) is not True:
                 return False
-            technical_depth = _row_depth(ws, row, grouping_column)
+            technical_depth = _row_depth(
+                ws,
+                row,
+                grouping_column,
+                prefer_outline=state.prefer_outline_depth,
+            )
             if technical_depth is None or technical_depth <= supplier_depth or has_total:
                 return False
             has_technical = True
         elif marker[0] == "total" and has_technical:
-            total_depth = _row_depth(ws, row, grouping_column)
+            total_depth = _row_depth(
+                ws,
+                row,
+                grouping_column,
+                prefer_outline=state.prefer_outline_depth,
+            )
             if total_depth is None or total_depth != supplier_depth:
                 return False
             has_total = True
@@ -993,7 +1171,13 @@ class GroupedOsvParser:
         if isinstance(grouping_column, ParserDiagnostic):
             return ParseResult(BalanceStatus.BLOCKED, diagnostics=(grouping_column,))
 
-        state = _HierarchyState()
+        state = _HierarchyState(
+            prefer_outline_depth=_has_coherent_outline_hierarchy(
+                ws,
+                grouping_column,
+                layout,
+            )
+        )
         balances: list[NormalizedBalance] = []
         diagnostics: list[ParserDiagnostic] = []
         seen_source_keys: dict[tuple[Any, ...], list[tuple[int, Decimal, Decimal]]] = {}
@@ -1006,7 +1190,12 @@ class GroupedOsvParser:
                 supported = _supported_account(account)
                 state.reset_for_account(
                     supported,
-                    _row_depth(ws, row, grouping_column),
+                    _row_depth(
+                        ws,
+                        row,
+                        grouping_column,
+                        prefer_outline=state.prefer_outline_depth,
+                    ),
                 )
                 if supported is None:
                     diagnostics.append(
@@ -1018,18 +1207,15 @@ class GroupedOsvParser:
                             grouping_column,
                         )
                     )
-                if _has_balance_payload(ws, row, layout):
-                    diagnostics.append(
-                        _diagnostic(
-                            ParserDiagnosticCode.MISSING_ORGANIZATION
-                            if supported is not None
-                            else ParserDiagnosticCode.MISSING_ACCOUNT_CONTEXT,
-                            "financial payload occurs on an account boundary before a complete hierarchy context",
-                            ws,
-                            row,
-                            grouping_column,
-                        )
-                    )
+                continue
+
+            if _is_merged_technical_continuation(
+                ws,
+                row,
+                grouping_column,
+                layout,
+                state,
+            ):
                 continue
 
             if state.account is None:
@@ -1124,18 +1310,6 @@ class GroupedOsvParser:
 
             state.set_identity(role, value_or_diagnostic)
             if role != "supplier":
-                if _has_balance_payload(ws, row, layout):
-                    code = _missing_context_code(state)
-                    if code is not None:
-                        diagnostics.append(
-                            _diagnostic(
-                                code,
-                                f"financial payload on a {role} hierarchy row lacks complete context",
-                                ws,
-                                row,
-                                grouping_column,
-                            )
-                        )
                 continue
 
             if not state.organization:
@@ -1337,7 +1511,12 @@ class GroupedOsvParser:
                             row,
                             grouping_column,
                         )
-                depth = _row_depth(ws, row, grouping_column)
+                depth = _row_depth(
+                    ws,
+                    row,
+                    grouping_column,
+                    prefer_outline=state.prefer_outline_depth,
+                )
                 depth_diagnostic = self._validate_role_depth(
                     ws,
                     row,
@@ -1352,7 +1531,12 @@ class GroupedOsvParser:
                 return role, marker_value
 
         value = _display_text(grouping_value)
-        depth = _row_depth(ws, row, grouping_column)
+        depth = _row_depth(
+            ws,
+            row,
+            grouping_column,
+            prefer_outline=state.prefer_outline_depth,
+        )
         role = self._role_from_depth(state, depth)
         if role is None:
             return None, _diagnostic(

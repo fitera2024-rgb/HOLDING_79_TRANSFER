@@ -409,15 +409,6 @@ def test_blank_non_financial_layout_row_can_be_skipped():
             [
                 ("79.2", None, None, 0),
                 ("АТ", None, None, 1),
-                ("ЦФО: ЦФО", None, None, 2),
-                ("Организация: АТ-новая", "100.00", 0, 1),
-            ],
-            ParserDiagnosticCode.MISSING_DEPARTMENT,
-        ),
-        (
-            [
-                ("79.2", None, None, 0),
-                ("АТ", None, None, 1),
                 ("Итого", "100.00", 0, 2),
             ],
             ParserDiagnosticCode.MISSING_DEPARTMENT,
@@ -439,6 +430,33 @@ def test_financial_payload_on_incomplete_non_leaf_context_blocks(rows, code):
     assert result.status is BalanceStatus.BLOCKED
     assert result.balances == ()
     assert any(diagnostic.code is code for diagnostic in result.diagnostics)
+
+
+def test_explicit_hierarchy_aggregates_are_not_supplier_financial_leaves():
+    result = parse(
+        [
+            ("79.2", "400.00", 0, 0),
+            ("Организация: АТ", "300.00", 0, 1),
+            ("ЦФО: ЦФО", "200.00", 0, 2),
+            ("Поставщик РВП: Поставщик", "100.00", 0, 3),
+        ]
+    )
+
+    assert result.status is BalanceStatus.ACTIONABLE
+    assert result.diagnostics == ()
+    assert len(result.balances) == 1
+    assert result.balances[0].ending_debit == Decimal("100.00")
+
+
+def test_unknown_financial_payload_after_complete_hierarchy_remains_fail_closed():
+    rows = leaf("79.2", "АТ", "ЦФО", "Поставщик", "1.00")
+    rows.append(("Неизвестная финансовая строка", "2.00", 0, 5))
+
+    result = parse(rows)
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.balances == ()
+    assert result.diagnostics[0].code is ParserDiagnosticCode.AMBIGUOUS_HIERARCHY
 
 
 def test_unlabelled_department_without_organization_blocks_instead_of_promoting_depth():
@@ -610,6 +628,73 @@ def make_structured_measure_workbook(*, grouping_column: int = 1) -> Workbook:
         for column, value in zip((5, 7, 9, 10, 11, 12, 6, 8), values[1:]):
             worksheet.cell(row, column).value = value
     return workbook
+
+
+def make_merged_hierarchy_workbook(*, account: str = "79.2") -> Workbook:
+    """Build merged hierarchy pairs with outline and visual indent on different scales."""
+
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Лист_1"
+    worksheet.merge_cells("K8:L8")
+    worksheet["K8"] = "Сальдо на конец периода"
+    worksheet["K9"] = "Дебет"
+    worksheet["L9"] = "Кредит"
+
+    hierarchy = (
+        (10, account, "400.00", 0, 0),
+        (12, "ORG_A", "300.00", 2, 1),
+        (14, "DEPARTMENT_A", "200.00", 4, 2),
+        (16, "SUPPLIER_A", "100.00", 6, 3),
+    )
+    for row, identity, debit, indent, outline_level in hierarchy:
+        worksheet.merge_cells(
+            start_row=row,
+            start_column=3,
+            end_row=row + 1,
+            end_column=5,
+        )
+        cell = worksheet.cell(row, 3)
+        cell.value = identity
+        cell.alignment = Alignment(indent=indent)
+        worksheet.cell(row, 6).value = "ОВ"
+        worksheet.cell(row + 1, 6).value = "ФВ"
+        worksheet.cell(row, 11).value = debit
+        worksheet.cell(row, 12).value = 0
+        worksheet.cell(row + 1, 11).value = debit
+        worksheet.cell(row + 1, 12).value = 0
+        worksheet.row_dimensions[row].outlineLevel = outline_level
+        worksheet.row_dimensions[row + 1].outlineLevel = outline_level
+    return workbook
+
+
+@pytest.mark.parametrize("account", ["79.2", "79.3"])
+def test_merged_outline_hierarchy_aggregates_are_context_not_financial_leaves(account):
+    workbook = make_merged_hierarchy_workbook(account=account)
+
+    result = parse_grouped_osv(workbook, period_end=date(2024, 12, 31))
+
+    assert result.diagnostics == ()
+    assert result.status is BalanceStatus.ACTIONABLE
+    assert len(result.balances) == 1
+    balance = result.balances[0]
+    assert balance.source_account.value == account
+    assert balance.organization == "ORG_A"
+    assert balance.department == "DEPARTMENT_A"
+    assert balance.supplier_rvp == "SUPPLIER_A"
+    assert balance.ending_debit == Decimal("100.00")
+    assert balance.source_excel_row_ref == "Лист_1!R16"
+
+
+def test_merged_technical_continuation_with_conflicting_payload_remains_fail_closed():
+    workbook = make_merged_hierarchy_workbook()
+    workbook.active.cell(17, 11).value = "101.00"
+
+    result = parse_grouped_osv(workbook, period_end=date(2024, 12, 31))
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.balances == ()
+    assert any(diagnostic.excel_row == 17 for diagnostic in result.diagnostics)
 
 
 def test_structural_grouping_ignores_decimal_measure_candidates():
