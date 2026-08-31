@@ -46,7 +46,7 @@ def period_end(text: str) -> tuple[date, str]:
     if not 1 <= month <= 12:
         raise ValueError("Некорректный месяц периода.")
     end = date(year, month, monthrange(year, month)[1])
-    return end, f"{MONTHS[month - 1][:-1] if MONTHS[month - 1].endswith('я') else MONTHS[month - 1]} {year}"
+    return end, f"{month:02d}.{year}"
 
 
 def multipart(body: bytes, content_type: str) -> tuple[dict[str, str], dict[str, tuple[str, bytes]]]:
