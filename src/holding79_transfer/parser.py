@@ -827,7 +827,7 @@ def _is_merged_technical_continuation(
     grouping_column: int,
     layout: EndingBalanceColumns,
     state: _HierarchyState,
-) -> bool:
+) -> bool | ParserDiagnostic:
     """Recognize the second presentation row of a merged ОВ/ФВ hierarchy pair."""
 
     span = next(
@@ -840,7 +840,7 @@ def _is_merged_technical_continuation(
         ),
         None,
     )
-    if span is None or not _display_text(ws.cell(span.min_row, span.min_col).value):
+    if span is None:
         return False
 
     measure_columns = _measure_columns_from_headers(
@@ -878,10 +878,21 @@ def _is_merged_technical_continuation(
             _excel_decimal(ws.cell(row, column).value)
             for column in (layout.debit_column, layout.credit_column)
         )
-    except (TypeError, ValueError):
-        return False
+    except (TypeError, ValueError) as exc:
+        return _diagnostic(
+            ParserDiagnosticCode.MALFORMED_ENDING_BALANCE,
+            f"malformed merged hierarchy continuation: {exc}",
+            ws,
+            row,
+        )
     if anchor_balance != continuation_balance:
-        return False
+        return _diagnostic(
+            ParserDiagnosticCode.AMBIGUOUS_HIERARCHY,
+            "merged ОВ/ФВ hierarchy rows have conflicting financial payloads",
+            ws,
+            row,
+            grouping_column,
+        )
 
     account = _row_account_token(ws, span.min_row, grouping_column, layout)
     if account is not None:
@@ -893,16 +904,9 @@ def _is_merged_technical_continuation(
         grouping_column,
         prefer_outline=state.prefer_outline_depth,
     )
-    identities = {
-        "organization": state.organization,
-        "department": state.department,
-        "supplier": state.supplier_rvp,
-    }
     return any(
-        identity
-        and state.role_depths is not None
-        and state.role_depths.get(role) == anchor_depth
-        for role, identity in identities.items()
+        state.role_depths is not None and state.role_depths.get(role) == anchor_depth
+        for role in ("organization", "department", "supplier")
     )
 
 
@@ -1227,13 +1231,17 @@ class GroupedOsvParser:
                     )
                 continue
 
-            if _is_merged_technical_continuation(
+            merged_continuation = _is_merged_technical_continuation(
                 ws,
                 row,
                 grouping_column,
                 layout,
                 state,
-            ):
+            )
+            if isinstance(merged_continuation, ParserDiagnostic):
+                diagnostics.append(merged_continuation)
+                continue
+            if merged_continuation:
                 continue
 
             if state.account is None:
@@ -1297,8 +1305,16 @@ class GroupedOsvParser:
                             )
                         )
                     continue
-            if not _display_text(grouping_value) and not _has_balance_payload(ws, row, layout):
-                continue
+            has_balance_payload = _has_balance_payload(ws, row, layout)
+            if not _display_text(grouping_value) and not has_balance_payload:
+                depth = _row_depth(
+                    ws,
+                    row,
+                    grouping_column,
+                    prefer_outline=state.prefer_outline_depth,
+                )
+                if depth is None:
+                    continue
 
             role, value_or_diagnostic = self._classify_row(ws, row, grouping_column, layout, state)
             if isinstance(value_or_diagnostic, ParserDiagnostic):
@@ -1308,8 +1324,9 @@ class GroupedOsvParser:
                 continue
             if value_or_diagnostic is None:
                 # A bare hierarchy label is a presentation header.  A row
-                # with amounts, however, is a malformed financial leaf.
-                if _has_balance_payload(ws, row, layout):
+                # with amounts is exportable only at the structurally known
+                # supplier-leaf depth; organization remains mandatory.
+                if has_balance_payload and role != "supplier":
                     code = {
                         "organization": ParserDiagnosticCode.MISSING_ORGANIZATION,
                         "department": ParserDiagnosticCode.MISSING_DEPARTMENT,
@@ -1324,9 +1341,11 @@ class GroupedOsvParser:
                             grouping_column,
                         )
                     )
-                continue
-
-            state.set_identity(role, value_or_diagnostic)
+                    continue
+                if not has_balance_payload:
+                    continue
+            else:
+                state.set_identity(role, value_or_diagnostic)
             if role != "supplier":
                 continue
 
@@ -1341,29 +1360,6 @@ class GroupedOsvParser:
                     )
                 )
                 continue
-            if not state.department:
-                diagnostics.append(
-                    _diagnostic(
-                        ParserDiagnosticCode.MISSING_DEPARTMENT,
-                        "supplier leaf has no department/ЦФО context",
-                        ws,
-                        row,
-                        grouping_column,
-                    )
-                )
-                continue
-            if not state.supplier_rvp:
-                diagnostics.append(
-                    _diagnostic(
-                        ParserDiagnosticCode.MISSING_SUPPLIER_RVP,
-                        "supplier leaf has an empty Поставщик РВП identity",
-                        ws,
-                        row,
-                        grouping_column,
-                    )
-                )
-                continue
-
             try:
                 debit = _excel_decimal(ws.cell(row, layout.debit_column).value)
                 credit = _excel_decimal(ws.cell(row, layout.credit_column).value)
@@ -1495,23 +1491,14 @@ class GroupedOsvParser:
                         row,
                         grouping_column,
                     )
-                if role == "supplier":
-                    if not state.organization:
-                        return role, _diagnostic(
-                            ParserDiagnosticCode.MISSING_ORGANIZATION,
-                            "supplier row occurs before an organization context",
-                            ws,
-                            row,
-                            grouping_column,
-                        )
-                    if not state.department:
-                        return role, _diagnostic(
-                            ParserDiagnosticCode.MISSING_DEPARTMENT,
-                            "supplier row occurs before a department context",
-                            ws,
-                            row,
-                            grouping_column,
-                        )
+                if role == "supplier" and not state.organization:
+                    return role, _diagnostic(
+                        ParserDiagnosticCode.MISSING_ORGANIZATION,
+                        "supplier row occurs before an organization context",
+                        ws,
+                        row,
+                        grouping_column,
+                    )
                 if marker_value is None:
                     candidates = _identity_candidates(ws, row, grouping_column, layout, role)
                     if len(candidates) == 1:
@@ -1564,6 +1551,7 @@ class GroupedOsvParser:
                 row,
                 grouping_column,
             )
+        state.invalidate_for_boundary(role)
         depth_diagnostic = self._validate_role_depth(
             ws,
             row,
@@ -1650,6 +1638,26 @@ class GroupedOsvParser:
 
     @staticmethod
     def _role_from_depth(state: _HierarchyState, depth: int | None) -> str | None:
+        if depth is not None and state.role_depths:
+            matching_roles = [
+                role
+                for role in ("organization", "department", "supplier")
+                if state.role_depths.get(role) == depth
+            ]
+            if len(matching_roles) == 1:
+                return matching_roles[0]
+            if len(matching_roles) > 1:
+                return None
+
+            department_depth = state.role_depths.get("department")
+            if department_depth is not None and depth == department_depth + 1:
+                return "supplier"
+            organization_depth = state.role_depths.get("organization")
+            if organization_depth is not None and depth == organization_depth + 1:
+                return "department"
+            if depth == state.account_depth + 1:
+                return "organization"
+            return None
         if not state.organization:
             if depth is None or depth != state.account_depth + 1:
                 return None
@@ -1664,17 +1672,6 @@ class GroupedOsvParser:
             if department_depth is None or depth is None or depth != department_depth + 1:
                 return None
             return "supplier"
-        if depth is not None and state.role_depths:
-            known = state.role_depths.get("supplier")
-            if known is not None and depth == known:
-                return "supplier"
-            organization_depth = state.role_depths.get("organization")
-            if organization_depth is not None and depth == organization_depth:
-                return "organization"
-            department_depth = state.role_depths.get("department")
-            if department_depth is not None and depth == department_depth:
-                return "department"
-            return None
         # Without depth metadata an unlabelled row cannot safely distinguish a
         # supplier from a new organization or department boundary.
         return None

@@ -255,7 +255,7 @@ def test_bare_organization_boundary_invalidates_stale_context():
     assert result.diagnostics[-1].code is ParserDiagnosticCode.MISSING_ORGANIZATION
 
 
-def test_bare_department_boundary_invalidates_stale_context():
+def test_bare_department_boundary_exports_blank_without_stale_context():
     rows = leaf("79.2", "A", "D", "S", "1.00")
     rows += [
         ("Подразделение", None, None, 2),
@@ -264,9 +264,11 @@ def test_bare_department_boundary_invalidates_stale_context():
 
     result = parse(rows)
 
-    assert result.status is BalanceStatus.BLOCKED
-    assert result.balances == ()
-    assert result.diagnostics[-1].code is ParserDiagnosticCode.MISSING_DEPARTMENT
+    assert result.status is BalanceStatus.ACTIONABLE
+    assert [(b.department, b.supplier_rvp) for b in result.balances] == [
+        ("D", "S"),
+        ("", "T"),
+    ]
 
 
 def test_new_department_cannot_repair_an_incomplete_organization_boundary():
@@ -287,7 +289,7 @@ def test_new_department_cannot_repair_an_incomplete_organization_boundary():
     )
 
 
-def test_supplier_payload_after_incomplete_department_boundary_is_blocked():
+def test_supplier_payload_after_incomplete_department_boundary_keeps_supplier():
     rows = leaf("79.2", "A", "D", "S", "1.00")
     rows += [
         ("ЦФО", None, None, 2),
@@ -296,9 +298,9 @@ def test_supplier_payload_after_incomplete_department_boundary_is_blocked():
 
     result = parse(rows)
 
-    assert result.status is BalanceStatus.BLOCKED
-    assert result.balances == ()
-    assert result.diagnostics[-1].code is ParserDiagnosticCode.MISSING_DEPARTMENT
+    assert result.status is BalanceStatus.ACTIONABLE
+    assert result.balances[-1].department == ""
+    assert result.balances[-1].supplier_rvp == "T"
 
 
 def test_complete_hierarchy_after_incomplete_boundary_restores_only_new_context():
@@ -512,7 +514,7 @@ def test_unlabelled_department_without_organization_blocks_instead_of_promoting_
     )
 
 
-def test_new_unlabelled_organization_without_department_does_not_reuse_old_department():
+def test_new_unlabelled_organization_without_department_exports_blank_not_neighbor():
     rows = [
         ("79.2", None, None, 0),
         ("Organization-A", None, None, 1),
@@ -524,12 +526,11 @@ def test_new_unlabelled_organization_without_department_does_not_reuse_old_depar
 
     result = parse(rows)
 
-    assert result.status is BalanceStatus.BLOCKED
-    assert result.balances == ()
-    assert any(
-        diagnostic.code is ParserDiagnosticCode.AMBIGUOUS_HIERARCHY
-        for diagnostic in result.diagnostics
-    )
+    assert result.status is BalanceStatus.ACTIONABLE
+    assert [(b.organization, b.department, b.supplier_rvp) for b in result.balances] == [
+        ("Organization-A", "Department-A", "Supplier-A"),
+        ("Organization-B", "", "Supplier-B"),
+    ]
 
 
 def test_missing_depth_metadata_blocks_unlabelled_supplier_boundary():
@@ -559,10 +560,11 @@ def test_wrong_hierarchy_depth_sequence_blocks_value_bearing_row():
     assert result.diagnostics[-1].code is ParserDiagnosticCode.AMBIGUOUS_HIERARCHY
 
 
-def test_blank_supplier_and_ambiguous_identity_are_blocked():
+def test_blank_supplier_is_exportable_but_ambiguous_identity_remains_blocked():
     blank = parse(leaf("79.2", "АТ", "ЦФО", "", "1.00"))
-    assert blank.status is BalanceStatus.BLOCKED
-    assert blank.diagnostics[0].code is ParserDiagnosticCode.MISSING_SUPPLIER_RVP
+    assert blank.status is BalanceStatus.ACTIONABLE
+    assert blank.diagnostics == ()
+    assert blank.balances[0].supplier_rvp == ""
 
     ambiguous_rows = leaf("79.2", "АТ", "ЦФО", "Производитель", "1.00")
     workbook = make_workbook(ambiguous_rows)
@@ -701,6 +703,131 @@ def make_merged_hierarchy_workbook(*, account: str = "79.2") -> Workbook:
         worksheet.row_dimensions[row].outlineLevel = outline_level
         worksheet.row_dimensions[row + 1].outlineLevel = outline_level
     return workbook
+
+
+def test_real_r94_shape_exports_blank_department_and_supplier():
+    workbook = make_merged_hierarchy_workbook()
+    worksheet = workbook.active
+    for row, identity, debit, indent, outline_level in (
+        (18, "ORG_B", 0, 2, 1),
+        (20, None, 0, 4, 2),
+        (22, None, "100.00", 6, 3),
+    ):
+        worksheet.merge_cells(
+            start_row=row,
+            start_column=3,
+            end_row=row + 1,
+            end_column=5,
+        )
+        cell = worksheet.cell(row, 3)
+        cell.value = identity
+        cell.alignment = Alignment(indent=indent)
+        worksheet.cell(row, 6).value = "ОВ"
+        worksheet.cell(row + 1, 6).value = "ФВ"
+        worksheet.cell(row, 11).value = debit
+        worksheet.cell(row, 12).value = 0
+        worksheet.cell(row + 1, 11).value = debit
+        worksheet.cell(row + 1, 12).value = 0
+        worksheet.row_dimensions[row].outlineLevel = outline_level
+        worksheet.row_dimensions[row + 1].outlineLevel = outline_level
+
+    result = parse_grouped_osv(workbook, period_end=date(2024, 12, 31))
+
+    assert result.status is BalanceStatus.ACTIONABLE
+    assert result.diagnostics == ()
+    assert len(result.balances) == 2
+    balance = next(balance for balance in result.balances if balance.organization == "ORG_B")
+    assert balance.department == ""
+    assert balance.supplier_rvp == ""
+    assert balance.ending_debit == Decimal("100.00")
+    assert balance.source_excel_row_ref == "Лист_1!R22"
+
+
+@pytest.mark.parametrize(
+    ("department", "supplier"),
+    (("", "SUPPLIER_A"), ("DEPARTMENT_A", ""), ("", "")),
+)
+def test_structural_supplier_leaf_preserves_known_and_blank_lower_analytics(
+    department, supplier
+):
+    rows = [
+        ("79.2", None, None, 0),
+        ("ORG_A", None, None, 1),
+        (department, None, None, 2),
+        (supplier, "100.00", 0, 3),
+    ]
+
+    result = parse(rows)
+
+    assert result.status is BalanceStatus.ACTIONABLE
+    assert result.diagnostics == ()
+    assert len(result.balances) == 1
+    assert result.balances[0].organization == "ORG_A"
+    assert result.balances[0].department == department
+    assert result.balances[0].supplier_rvp == supplier
+
+
+def test_blank_lower_analytics_never_inherit_neighbor_values():
+    rows = [
+        ("79.2", None, None, 0),
+        ("ORG_A", None, None, 1),
+        ("DEPARTMENT_A", None, None, 2),
+        ("SUPPLIER_A", "10.00", 0, 3),
+        ("", None, None, 2),
+        ("", "20.00", 0, 3),
+    ]
+
+    result = parse(rows)
+
+    assert result.status is BalanceStatus.ACTIONABLE
+    assert [(b.department, b.supplier_rvp) for b in result.balances] == [
+        ("DEPARTMENT_A", "SUPPLIER_A"),
+        ("", ""),
+    ]
+
+
+def test_structural_leaf_without_organization_remains_blocked():
+    result = parse(
+        [
+            ("79.2", None, None, 0),
+            ("", None, None, 1),
+            ("", None, None, 2),
+            ("Поставщик РВП", "100.00", 0, 3),
+        ]
+    )
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.balances == ()
+    assert result.diagnostics[0].code is ParserDiagnosticCode.MISSING_ORGANIZATION
+
+
+@pytest.mark.parametrize(
+    ("role_label", "row_indent", "expected_code"),
+    (
+        ("ЦФО", 2, ParserDiagnosticCode.AMBIGUOUS_DEPARTMENT),
+        ("Поставщик РВП", 3, ParserDiagnosticCode.AMBIGUOUS_SUPPLIER_RVP),
+    ),
+)
+def test_multiple_lower_identity_candidates_remain_blocked(
+    role_label, row_indent, expected_code
+):
+    rows = [
+        ("79.2", None, None, 0),
+        ("Организация: ORG_A", None, None, 1),
+    ]
+    if row_indent == 3:
+        rows.append(("ЦФО: DEPARTMENT_A", None, None, 2))
+    rows.append((role_label, "100.00", 0, row_indent))
+    workbook = make_workbook(rows)
+    worksheet = workbook.active
+    worksheet.cell(worksheet.max_row, 2).value = "CANDIDATE_A"
+    worksheet.cell(worksheet.max_row, 3).value = "CANDIDATE_B"
+
+    result = parse_grouped_osv(workbook, period_end=date(2024, 12, 31))
+
+    assert result.status is BalanceStatus.BLOCKED
+    assert result.balances == ()
+    assert result.diagnostics[-1].code is expected_code
 
 
 @pytest.mark.parametrize("account", ["79.2", "79.3"])

@@ -32,6 +32,7 @@ from .exporter import (
     XlsxExportError,
     deterministic_filename,
     export_posting_rows,
+    posting_has_blank_lower_analytics,
     validate_workbook_round_trip,
 )
 from .models import (
@@ -1317,8 +1318,8 @@ def _validate_artifacts(root: Path) -> None:
         source_account = _artifact_text(record, "source_account", label)
         if source_account not in {"79.2", "79.3"}:
             _artifact_failure(label, f"unsupported source_account: {source_account}")
-        department = _artifact_text(record, "department", label)
-        supplier = _artifact_text(record, "supplier_rvp", label)
+        department = _artifact_text(record, "department", label, allow_empty=True)
+        supplier = _artifact_text(record, "supplier_rvp", label, allow_empty=True)
         source_ref = _artifact_text(record, "source_excel_row_ref", label)
         status = _artifact_text(record, "status", label)
         if status not in {BalanceStatus.ACTIONABLE.value, BalanceStatus.NO_ACTION.value}:
@@ -1579,18 +1580,21 @@ def _validate_artifacts(root: Path) -> None:
             _artifact_failure(label, "workbook round_trip must be true")
         if _artifact_text(record, "status", label) != "PASS":
             _artifact_failure(label, "workbook status must be PASS")
-        expected_path = f"export/{deterministic_filename(document_date, document_organization)}"
-        if relative_path != expected_path:
-            _artifact_failure(label, "workbook path is not deterministic for its group")
-        if relative_path in manifest_export_paths:
-            _artifact_failure(label, f"duplicate workbook path: {relative_path}")
-        manifest_export_paths.append(relative_path)
         group_rows = tuple(
             row
             for row in posting_rows
             if row.period_end == document_date
             and row.document_organization == document_organization
         )
+        disputed = any(posting_has_blank_lower_analytics(row) for row in group_rows)
+        expected_path = (
+            f"export/{deterministic_filename(document_date, document_organization, disputed=disputed)}"
+        )
+        if relative_path != expected_path:
+            _artifact_failure(label, "workbook path is not deterministic for its group")
+        if relative_path in manifest_export_paths:
+            _artifact_failure(label, f"duplicate workbook path: {relative_path}")
+        manifest_export_paths.append(relative_path)
         if row_count != len(group_rows):
             _artifact_failure(label, "workbook row count does not match PostingRows group")
         manifest_export_row_count += row_count
@@ -2159,7 +2163,7 @@ def run_integration(
 
 
 def build_synthetic_osv_workbook() -> Workbook:
-    """Create the in-memory OSV covering the four approved goldens plus one block."""
+    """Create the in-memory OSV covering the goldens and a missing-organization block."""
 
     cases = (
         ("DEBIT_79_2_AT", "79.2", "84272.40", "0"),
@@ -2184,8 +2188,8 @@ def build_synthetic_osv_workbook() -> Workbook:
     _populate_synthetic_sheet(
         blocked,
         account="79.2",
-        organization="АТ",
-        department="Б_АТ Коммерческий отдел",
+        organization=None,
+        department=None,
         supplier=None,
         debit="100.00",
         credit="0",
@@ -2197,8 +2201,8 @@ def _populate_synthetic_sheet(
     worksheet: Worksheet,
     *,
     account: str,
-    organization: str,
-    department: str,
+    organization: str | None,
+    department: str | None,
     supplier: str | None,
     debit: str,
     credit: str,
@@ -2211,8 +2215,8 @@ def _populate_synthetic_sheet(
     worksheet["I5"] = "Кредит"
     rows = (
         (6, account, 0),
-        (7, f"Организация: {organization}", 1),
-        (8, f"ЦФО: {department}", 2),
+        (7, "" if organization is None else f"Организация: {organization}", 1),
+        (8, "" if department is None else f"ЦФО: {department}", 2),
         (9, "Поставщик РВП" if supplier is None else f"Поставщик РВП: {supplier}", 3),
     )
     for row, value, indent in rows:

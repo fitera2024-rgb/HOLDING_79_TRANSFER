@@ -80,6 +80,33 @@ def test_approved_golden_cases_generate_exactly_two_posting_rows(filename: str):
     assert result.rows[0].amount == result.rows[1].amount == Decimal("84272.40")
 
 
+@pytest.mark.parametrize(
+    ("department", "supplier"),
+    (("", "SUPPLIER_A"), ("DEPARTMENT_A", ""), ("", "")),
+)
+def test_blank_lower_analytics_generate_postings_without_placeholders(department, supplier):
+    balance = NormalizedBalance(
+        period_end=date(2024, 12, 31),
+        source_excel_row_ref="synthetic:blank-lower-analytics",
+        organization="ORG_A",
+        source_account="79.2",
+        department=department,
+        supplier_rvp=supplier,
+        ending_debit="100.00",
+    )
+
+    result = generate_transfer(balance)
+
+    assert result.status is BalanceStatus.ACTIONABLE
+    assert len(result.rows) == 2
+    source_row, manager_row = result.rows
+    assert source_row.debit_department == source_row.credit_department == department
+    assert source_row.credit_supplier_rvp == supplier
+    assert manager_row.credit_supplier_rvp == supplier
+    assert all(row.source_department == department for row in result.rows)
+    assert all(row.source_supplier_rvp == supplier for row in result.rows)
+
+
 @pytest.mark.parametrize("source_account", [SourceAccount.ACCOUNT_79_2, SourceAccount.ACCOUNT_79_3])
 @pytest.mark.parametrize("side", [BalanceSide.DEBIT, BalanceSide.CREDIT])
 def test_source_effect_control_proves_zero_balance_and_single_consumption(

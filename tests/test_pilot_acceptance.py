@@ -22,6 +22,7 @@ def test_documented_pilot_acceptance_command_passes(tmp_path: Path):
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "ACCEPTANCE=PASS" in completed.stdout
+    assert "disputed_blank_analytics=PASS" in completed.stdout
     assert (output_dir / "input_manifest.json").is_file()
     assert (output_dir / "run_control.xlsx").is_file()
     assert sorted(path.name for path in (output_dir / "export").glob("*.xlsx")) == [
