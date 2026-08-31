@@ -834,21 +834,27 @@ def _numeric_measure_payload(
         return None
 
 
-def _is_merged_technical_continuation(
+def _is_proven_non_leaf_merged_pair_member(
     ws: Worksheet,
     row: int,
     grouping_column: int,
     layout: EndingBalanceColumns,
     state: _HierarchyState,
 ) -> bool | ParserDiagnostic:
-    """Recognize the second presentation row of a merged ОВ/ФВ hierarchy pair."""
+    """Recognize a row that belongs to a structurally proven non-leaf pair.
+
+    Ordinary hierarchy anchors must still update parser context, so only their
+    merged continuation is classified as non-leaf.  A proven report-wide root
+    total is different: both its anchor and continuation are presentation rows
+    and are classified atomically before lower-analytics validation.
+    """
 
     span = next(
         (
             merged
             for merged in ws.merged_cells.ranges
             if merged.min_col == grouping_column
-            and merged.min_row < row <= merged.max_row
+            and merged.min_row <= row <= merged.max_row
             and merged.min_col <= grouping_column <= merged.max_col
         ),
         None,
@@ -878,7 +884,7 @@ def _is_merged_technical_continuation(
         return tokens[0] if len(tokens) == 1 else None
 
     anchor_token = technical_token(span.min_row)
-    continuation_token = technical_token(row)
+    continuation_token = technical_token(span.max_row)
     if {anchor_token, continuation_token} != {"ов", "фв"}:
         return False
 
@@ -888,10 +894,12 @@ def _is_merged_technical_continuation(
             for column in (layout.debit_column, layout.credit_column)
         )
         continuation_balance = tuple(
-            _excel_decimal(ws.cell(row, column).value)
+            _excel_decimal(ws.cell(span.max_row, column).value)
             for column in (layout.debit_column, layout.credit_column)
         )
     except (TypeError, ValueError) as exc:
+        if row == span.min_row:
+            return False
         return _diagnostic(
             ParserDiagnosticCode.MALFORMED_ENDING_BALANCE,
             f"malformed merged hierarchy continuation: {exc}",
@@ -899,6 +907,8 @@ def _is_merged_technical_continuation(
             row,
         )
     if anchor_balance != continuation_balance:
+        if row == span.min_row:
+            return False
         return _diagnostic(
             ParserDiagnosticCode.AMBIGUOUS_HIERARCHY,
             "merged ОВ/ФВ hierarchy rows have conflicting financial payloads",
@@ -907,22 +917,12 @@ def _is_merged_technical_continuation(
             grouping_column,
         )
 
-    account = _row_account_token(ws, span.min_row, grouping_column, layout)
-    if account is not None:
-        return state.account is not None and state.account is _supported_account(account)
-
     anchor_depth = _row_depth(
         ws,
         span.min_row,
         grouping_column,
         prefer_outline=state.prefer_outline_depth,
     )
-    if any(
-        state.role_depths is not None and state.role_depths.get(role) == anchor_depth
-        for role in ("organization", "department", "supplier")
-    ):
-        return True
-
     # A report-wide total uses the same merged OV/FV presentation as hierarchy
     # aggregates, but sits at the supported account's root depth.  Default
     # outline level 0 is not evidence on its own: only a workbook whose 1/2/3
@@ -935,37 +935,59 @@ def _is_merged_technical_continuation(
         or anchor_marker is None
         or anchor_marker[0] != "total"
         or span.max_row != span.min_row + 1
-        or row != span.max_row
     ):
+        proven_root_total = False
+    else:
+        account_aggregate_row = None
+        for candidate_row in range(span.min_row - 1, layout.header_rows[-1], -1):
+            candidate_token = _row_account_token(ws, candidate_row, grouping_column, layout)
+            if candidate_token is None:
+                continue
+            candidate_account = _supported_account(candidate_token)
+            candidate_depth = _row_depth(
+                ws,
+                candidate_row,
+                grouping_column,
+                prefer_outline=state.prefer_outline_depth,
+            )
+            if candidate_account is not state.account or candidate_depth != state.account_depth:
+                account_aggregate_row = None
+                break
+            account_aggregate_row = candidate_row
+            break
+
+        if account_aggregate_row is None:
+            proven_root_total = False
+        else:
+            measure_columns.update((layout.debit_column, layout.credit_column))
+            account_payload = _numeric_measure_payload(
+                ws,
+                account_aggregate_row,
+                measure_columns,
+            )
+            anchor_payload = _numeric_measure_payload(ws, span.min_row, measure_columns)
+            continuation_payload = _numeric_measure_payload(ws, span.max_row, measure_columns)
+            proven_root_total = (
+                account_payload is not None
+                and anchor_payload == account_payload
+                and continuation_payload == account_payload
+            )
+
+    if proven_root_total:
+        return True
+
+    # Non-root anchors carry the identity used by later leaf rows.  Only their
+    # second merged presentation row is a continuation to skip.
+    if row == span.min_row:
         return False
 
-    account_aggregate_row = None
-    for candidate_row in range(span.min_row - 1, layout.header_rows[-1], -1):
-        candidate_token = _row_account_token(ws, candidate_row, grouping_column, layout)
-        if candidate_token is None:
-            continue
-        candidate_account = _supported_account(candidate_token)
-        candidate_depth = _row_depth(
-            ws,
-            candidate_row,
-            grouping_column,
-            prefer_outline=state.prefer_outline_depth,
-        )
-        if candidate_account is not state.account or candidate_depth != state.account_depth:
-            return False
-        account_aggregate_row = candidate_row
-        break
-    if account_aggregate_row is None:
-        return False
+    account = _row_account_token(ws, span.min_row, grouping_column, layout)
+    if account is not None:
+        return state.account is not None and state.account is _supported_account(account)
 
-    measure_columns.update((layout.debit_column, layout.credit_column))
-    account_payload = _numeric_measure_payload(ws, account_aggregate_row, measure_columns)
-    anchor_payload = _numeric_measure_payload(ws, span.min_row, measure_columns)
-    continuation_payload = _numeric_measure_payload(ws, row, measure_columns)
-    return (
-        account_payload is not None
-        and anchor_payload == account_payload
-        and continuation_payload == account_payload
+    return any(
+        state.role_depths is not None and state.role_depths.get(role) == anchor_depth
+        for role in ("organization", "department", "supplier")
     )
 
 
@@ -1290,17 +1312,17 @@ class GroupedOsvParser:
                     )
                 continue
 
-            merged_continuation = _is_merged_technical_continuation(
+            merged_pair_member = _is_proven_non_leaf_merged_pair_member(
                 ws,
                 row,
                 grouping_column,
                 layout,
                 state,
             )
-            if isinstance(merged_continuation, ParserDiagnostic):
-                diagnostics.append(merged_continuation)
+            if isinstance(merged_pair_member, ParserDiagnostic):
+                diagnostics.append(merged_pair_member)
                 continue
-            if merged_continuation:
+            if merged_pair_member:
                 continue
 
             if state.account is None:
