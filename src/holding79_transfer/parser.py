@@ -821,6 +821,19 @@ def _has_balance_payload(ws: Worksheet, row: int, layout: EndingBalanceColumns) 
     return False
 
 
+def _numeric_measure_payload(
+    ws: Worksheet,
+    row: int,
+    measure_columns: set[int],
+) -> tuple[Decimal, ...] | None:
+    """Return a comparable numeric report payload, or no structural proof."""
+
+    try:
+        return tuple(_excel_decimal(ws.cell(row, column).value) for column in sorted(measure_columns))
+    except (TypeError, ValueError):
+        return None
+
+
 def _is_merged_technical_continuation(
     ws: Worksheet,
     row: int,
@@ -904,9 +917,55 @@ def _is_merged_technical_continuation(
         grouping_column,
         prefer_outline=state.prefer_outline_depth,
     )
-    return any(
+    if any(
         state.role_depths is not None and state.role_depths.get(role) == anchor_depth
         for role in ("organization", "department", "supplier")
+    ):
+        return True
+
+    # A report-wide total uses the same merged OV/FV presentation as hierarchy
+    # aggregates, but sits at the supported account's root depth.  Default
+    # outline level 0 is not evidence on its own: only a workbook whose 1/2/3
+    # outline hierarchy has already been proven can make that root semantic.
+    anchor_marker = _role_marker(ws.cell(span.min_row, grouping_column).value)
+    if (
+        state.account is None
+        or not state.prefer_outline_depth
+        or anchor_depth != state.account_depth
+        or anchor_marker is None
+        or anchor_marker[0] != "total"
+        or span.max_row != span.min_row + 1
+        or row != span.max_row
+    ):
+        return False
+
+    account_aggregate_row = None
+    for candidate_row in range(span.min_row - 1, layout.header_rows[-1], -1):
+        candidate_token = _row_account_token(ws, candidate_row, grouping_column, layout)
+        if candidate_token is None:
+            continue
+        candidate_account = _supported_account(candidate_token)
+        candidate_depth = _row_depth(
+            ws,
+            candidate_row,
+            grouping_column,
+            prefer_outline=state.prefer_outline_depth,
+        )
+        if candidate_account is not state.account or candidate_depth != state.account_depth:
+            return False
+        account_aggregate_row = candidate_row
+        break
+    if account_aggregate_row is None:
+        return False
+
+    measure_columns.update((layout.debit_column, layout.credit_column))
+    account_payload = _numeric_measure_payload(ws, account_aggregate_row, measure_columns)
+    anchor_payload = _numeric_measure_payload(ws, span.min_row, measure_columns)
+    continuation_payload = _numeric_measure_payload(ws, row, measure_columns)
+    return (
+        account_payload is not None
+        and anchor_payload == account_payload
+        and continuation_payload == account_payload
     )
 
 
