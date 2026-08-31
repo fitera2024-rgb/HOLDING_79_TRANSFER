@@ -39,7 +39,7 @@ jobs:
       - name: Build web EXE
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --clean --onefile --windowed --name HOLDING79_TRANSFER_WEB_TEST --paths src tools/windows_test_app.py
+          pyinstaller --noconfirm --clean --onefile --windowed --name HOLDING79_TRANSFER_WEB_TEST --paths src tools/windows_web_app.py
 
       - name: Verify artifact
         shell: pwsh
