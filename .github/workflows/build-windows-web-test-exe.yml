@@ -35,12 +35,12 @@ jobs:
           python -m ruff check src tests
           git diff --check
           python -c "import holding79_transfer; print(holding79_transfer.__version__)"
-          python -m py_compile tools/windows_web_app.py
+          python -m py_compile tools/windows_web_app.py tools/windows_web_app_fitera_ref.py
 
       - name: Build web EXE
         shell: pwsh
         run: |
-          pyinstaller --noconfirm --clean --onefile --windowed --name HOLDING79_TRANSFER_WEB_TEST --paths src tools/windows_web_app.py
+          pyinstaller --noconfirm --clean --onefile --windowed --name HOLDING79_TRANSFER_WEB_TEST --paths . --paths src --paths tools tools/windows_web_app_fitera_ref.py
 
       - name: Verify artifact
         shell: pwsh
