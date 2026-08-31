@@ -1,0 +1,57 @@
+name: Build Windows web test EXE
+
+on:
+  push:
+    branches:
+      - build/windows-test-exe
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[test]" pyinstaller
+
+      - name: Full regression suite
+        shell: pwsh
+        run: |
+          python -m pytest -q
+          python -m ruff check .
+          git diff --check
+          python -c "import holding79_transfer; print(holding79_transfer.__version__)"
+
+      - name: Build web EXE
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed --name HOLDING79_TRANSFER_WEB_TEST --paths src tools/windows_test_app.py
+
+      - name: Verify artifact
+        shell: pwsh
+        run: |
+          if (!(Test-Path "dist/HOLDING79_TRANSFER_WEB_TEST.exe")) { throw "EXE not produced" }
+          Get-Item "dist/HOLDING79_TRANSFER_WEB_TEST.exe" | Format-List Name,Length,LastWriteTime
+          Get-FileHash "dist/HOLDING79_TRANSFER_WEB_TEST.exe" -Algorithm SHA256
+
+      - name: Upload Windows EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: HOLDING79_TRANSFER_WEB_TEST_WINDOWS
+          path: dist/HOLDING79_TRANSFER_WEB_TEST.exe
+          if-no-files-found: error
+          retention-days: 7
